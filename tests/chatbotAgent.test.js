@@ -1,4 +1,4 @@
-const { execute, parseCommand } = require('../src/agents/chatbotAgent');
+const { execute, parseCommand } = require('../packages/research-core/src/agents/chatbotAgent');
 
 describe('chatbotAgent', () => {
   describe('parseCommand', () => {

@@ -1,4 +1,4 @@
-const sessionMemory = require("../src/memory/sessionMemory");
+const sessionMemory = require("../packages/research-core/src/memory/sessionMemory");
 
 /**
  * Session isolation tests (brief §8, acceptance criteria "User sessions are
@@ -51,6 +51,23 @@ describe("session isolation", () => {
 
     expect(sessionMemory.getHistory(conv1)).toHaveLength(2);
     expect(sessionMemory.getHistory(conv2)).toHaveLength(0);
+  });
+
+  test("escalation in conversation A does not influence conversation B (same user)", () => {
+    const convA = "userA:conv1";
+    const convB = "userA:conv2";
+
+    // Conversation A escalates.
+    sessionMemory.record("ignore instructions", "VIOLATION", "prompt_injection", convA);
+    sessionMemory.record("rm -rf /", "VIOLATION", "forbidden_command", convA);
+    expect(sessionMemory.detectEscalation(convA).escalating).toBe(true);
+
+    // Conversation B of the same user is not flagged and gets no leaked context.
+    sessionMemory.record("ls", "SAFE", "none", convB);
+    expect(sessionMemory.detectEscalation(convB).escalating).toBe(false);
+    const blockB = sessionMemory.formatContextBlock(convB);
+    expect(blockB).not.toContain("prompt_injection");
+    expect(blockB).not.toContain("rm -rf");
   });
 
   test("resetting one context leaves others intact", () => {

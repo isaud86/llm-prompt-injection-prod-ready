@@ -1,0 +1,14 @@
+{
+  "name": "@llm-injection/research-core",
+  "version": "1.0.0",
+  "description": "Hybrid rule-LLM defense pipeline (research core). Framework-free: no HTTP server, auth, billing, database, or cloud dependencies. Consumed by production apps via the public API in index.js.",
+  "license": "GPL-3.0-or-later",
+  "main": "index.js",
+  "private": true,
+  "dependencies": {
+    "@chroma-core/default-embed": "^0.1.9",
+    "chromadb": "^3.3.0",
+    "dotenv": "^17.2.4",
+    "ollama": "^0.6.3"
+  }
+}

@@ -22,7 +22,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const policemanAgent = require('../src/agents/policemanAgent');
+const policemanAgent = require('../packages/research-core/src/agents/policemanAgent');
 
 const DATASET_PATH = path.join(__dirname, '..', 'data', 'evaluation-dataset.json');
 const OUTPUT_PATH = path.join(__dirname, '..', 'data', 'results', 'ablation-raw.json');

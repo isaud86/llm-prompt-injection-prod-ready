@@ -7,7 +7,7 @@
 
 const path = require("path");
 const fs = require("fs");
-const { STATIC_ATTACKS } = require("../src/agents/hackerAgent");
+const { STATIC_ATTACKS } = require("../packages/research-core/src/agents/hackerAgent");
 
 const OUTPUT_PATH = path.join(
   __dirname,

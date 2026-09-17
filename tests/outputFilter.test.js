@@ -1,4 +1,4 @@
-const { filterOutput, sanitizeError } = require('../src/validators/outputFilter');
+const { filterOutput, sanitizeError } = require('../packages/research-core/src/validators/outputFilter');
 
 describe('outputFilter', () => {
   describe('filterOutput', () => {

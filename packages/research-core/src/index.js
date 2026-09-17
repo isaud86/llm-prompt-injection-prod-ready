@@ -2,6 +2,7 @@ const readline = require('readline');
 const policemanAgent = require('./agents/policemanAgent');
 const { loadRecentViolations } = require('./memory/longTermMemory');
 const config = require('./utils/config');
+const { PRESETS } = require('./presets');
 
 // ANSI color codes
 const COLORS = {
@@ -77,14 +78,6 @@ const LAYER_BADGES = {
   useRateLimit: 'L',
   useMemory: 'M',
   useRAG: 'G',
-};
-
-const PRESETS = {
-  c1: { useRules: true,  useSemantic: false, useRateLimit: false, useMemory: false, useRAG: false },
-  c2: { useRules: false, useSemantic: true,  useRateLimit: false, useMemory: false, useRAG: false },
-  c3: { useRules: true,  useSemantic: true,  useRateLimit: false, useMemory: false, useRAG: false },
-  c4: { useRules: true,  useSemantic: true,  useRateLimit: true,  useMemory: true,  useRAG: false },
-  c5: { useRules: true,  useSemantic: true,  useRateLimit: true,  useMemory: true,  useRAG: true  },
 };
 
 function defaultFlags() {

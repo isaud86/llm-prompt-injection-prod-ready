@@ -1,7 +1,7 @@
-const policemanAgent = require("../src/agents/policemanAgent");
+const policemanAgent = require("../packages/research-core/src/agents/policemanAgent");
 
 // Mock semantic validator so the pipeline runs offline (no Ollama needed).
-jest.mock("../src/validators/semanticValidator", () => ({
+jest.mock("../packages/research-core/src/validators/semanticValidator", () => ({
   analyze: jest.fn().mockResolvedValue({ safe: true, threats: [], fallback: true }),
 }));
 

@@ -1,4 +1,4 @@
-const { validate, extractCommands, getBaseCommand, detectEncoding } = require('../src/validators/ruleBasedValidator');
+const { validate, extractCommands, getBaseCommand, detectEncoding } = require('../packages/research-core/src/validators/ruleBasedValidator');
 
 describe('ruleBasedValidator', () => {
   describe('extractCommands', () => {

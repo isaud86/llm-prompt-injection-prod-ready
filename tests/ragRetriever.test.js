@@ -1,9 +1,9 @@
-jest.mock("../src/rag/chromaClient", () => ({
+jest.mock("../packages/research-core/src/rag/chromaClient", () => ({
   getCollection: jest.fn(),
 }));
 
-const { getCollection } = require("../src/rag/chromaClient");
-const { retrieveSimilarPatterns } = require("../src/rag/ragRetriever");
+const { getCollection } = require("../packages/research-core/src/rag/chromaClient");
+const { retrieveSimilarPatterns } = require("../packages/research-core/src/rag/ragRetriever");
 
 describe("ragRetriever", () => {
   beforeEach(() => {

@@ -1,24 +1,26 @@
 const fs = require("fs");
-const { getCollection } = require("../rag/chromaClient");
 const config = require("../utils/config");
+const { defaultVectorStore } = require("../providers");
 
 const ID_PREFIX = "rt-";
 
 /**
- * Persist a blocked attack into ChromaDB for future RAG retrieval.
+ * Persist a blocked attack into the vector store for future RAG retrieval.
  * Skips rate_limit violations (behavioral, not semantic patterns).
- * Degrades gracefully — never throws.
+ * Degrades gracefully — never throws. The vector store is injectable.
  */
-async function storeBlockedPattern(input, violationType, confidence) {
+async function storeBlockedPattern(
+  input,
+  violationType,
+  confidence,
+  vectorStore = defaultVectorStore,
+) {
   if (!config.memory.longTermEnabled) return;
   if (violationType === "rate_limit") return;
 
   try {
-    const col = await getCollection();
-    if (!col) return;
-
     const id = `${ID_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    await col.add({
+    await vectorStore.add({
       ids: [id],
       documents: [input.substring(0, 500)],
       metadatas: [

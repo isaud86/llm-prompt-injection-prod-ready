@@ -1,4 +1,4 @@
-const sessionMemory = require("../src/memory/sessionMemory");
+const sessionMemory = require("../packages/research-core/src/memory/sessionMemory");
 
 describe("sessionMemory", () => {
   beforeEach(() => {
