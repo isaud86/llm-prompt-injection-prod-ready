@@ -1,6 +1,26 @@
 require("dotenv").config();
 
+// --- Operating mode (brief §3) ---
+// Research Mode (default) preserves original experimental behavior: fail-open
+// semantic validation, shared session memory permitted, ChromaDB, command
+// execution on. Production Mode enables fail-safe behavior, strict per-user
+// isolation, and safe defaults. Setting PRODUCTION_MODE=true implies Research
+// Mode is off unless RESEARCH_MODE=true is set explicitly (not recommended on a
+// public production path). Defaulting to Research Mode guarantees that existing
+// experiments and the C1–C5 ablation are unchanged when no env is provided.
+const productionMode = process.env.PRODUCTION_MODE === "true";
+const researchMode = productionMode
+  ? process.env.RESEARCH_MODE === "true"
+  : process.env.RESEARCH_MODE !== "false";
+
 const config = {
+  mode: {
+    research: researchMode,
+    production: productionMode,
+    // Semantic validator behavior when the LLM is unavailable:
+    // research → fail open (rules only); production → fail safe.
+    failOpenOnInferenceError: researchMode && !productionMode,
+  },
   ollama: {
     host: process.env.OLLAMA_HOST || "http://127.0.0.1:11434",
     model: process.env.OLLAMA_MODEL || "llama3.2:1b",

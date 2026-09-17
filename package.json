@@ -4,6 +4,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "captureEnv": "node scripts/captureEnvironment.js",
     "test": "jest --verbose",
     "test:watch": "jest --watch",
     "seed": "node scripts/seedChromaDB.js",

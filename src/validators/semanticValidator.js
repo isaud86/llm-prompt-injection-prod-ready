@@ -122,10 +122,17 @@ async function analyze(input, contextBlock = null, evalOptions = {}) {
       fallback: false,
     };
   } catch (err) {
-    // If Ollama is unavailable, return a fallback result
+    // Inference unavailable. Behavior is mode-gated (brief §3, §38):
+    //  - Research Mode (default): FAIL OPEN — degrade to rule-based only so the
+    //    experiment continues exactly as before (safe: true, fallback: true).
+    //  - Production Mode: FAIL SAFE — do not silently trust unvalidated input;
+    //    signal not-safe so the pipeline can degrade to a safe refusal.
+    // The default config is Research Mode, so this preserves the original
+    // experimental behavior (see docs/RESEARCH_REPRODUCIBILITY.md §5).
     console.error(`[SemanticValidator] Ollama error: ${err.message}`);
+    const failOpen = config.mode.failOpenOnInferenceError;
     return {
-      safe: true, // Fall back to rule-based only
+      safe: failOpen,
       threats: [],
       fallback: true,
       error: err.message,
