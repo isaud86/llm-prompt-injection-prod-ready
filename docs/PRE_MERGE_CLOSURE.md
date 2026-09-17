@@ -102,10 +102,37 @@ runtime from the research/embedding runtime (later phase).
 - Command execution still enabled in research mode — Phase 13.
 - **Full C1–C5 numeric research parity is unverified** until run on the GPU host
   (§10–§11).
+- **`docker-compose.yml` pins `chromadb/chroma:latest`** (a moving tag). For this
+  validation the exact image digest is frozen and reused for both runs (§0/§E), so
+  it does not affect parity. **Recommended follow-up (separate change, after
+  successful research validation):** replace `chromadb/chroma:latest` with a
+  pinned version or `@sha256:` digest in `docker-compose.yml` for reproducible
+  deployments. Not changed in this documentation-only correction.
 
 ## 10. AWS GPU validation package (run on the EC2 GPU host)
 
 Run against the **exact final commit SHA** of `feat/production-api`. Do not deploy.
+
+**0. Freeze shared artifacts (do this ONCE, before either run).** Baseline and
+candidate MUST use identical model digests, dataset, and ChromaDB image, or the
+comparison is invalid. Record them to `validation/FROZEN.txt` and reuse them.
+```bash
+mkdir -p validation
+# --- Ollama: RECORD FIRST, do not update existing models (see D) ---
+ollama --version | tee validation/FROZEN.txt
+ollama list                                   # inspect NAME + ID(digest) columns
+# --- ChromaDB image: pin the exact digest currently on the host (see E) ---
+docker image inspect chromadb/chroma:latest --format '{{index .RepoDigests 0}}' \
+  | tee -a validation/FROZEN.txt              # e.g. chromadb/chroma@sha256:...
+# --- Dataset + lockfile hashes (candidate tree) ---
+sha256sum data/evaluation-dataset.json | tee -a validation/FROZEN.txt
+sha256sum package-lock.json            | tee -a validation/FROZEN.txt
+```
+Export the frozen Chroma image ref for reuse by both runs:
+```bash
+CHROMA_IMG=$(docker image inspect chromadb/chroma:latest --format '{{index .RepoDigests 0}}')
+echo "$CHROMA_IMG"     # both baseline and candidate containers use THIS exact ref
+```
 
 **A. Repository validation**
 ```bash
@@ -131,31 +158,47 @@ nvidia-smi                                   # GPU present; note driver + CUDA v
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 ```
 
-**D. Ollama**
+**D. Ollama — RECORD models FIRST; only pull if MISSING (never update).**
+Updating a model changes its digest and invalidates the comparison.
 ```bash
-ollama --version
+ollama --version             # record the version
+ollama list                  # RECORD NAME + ID(digest) for each model FIRST
+ollama ps                    # currently loaded models
 ollama serve &               # if not already a service
-ollama pull qwen3.5:2b
-ollama pull llama3.2:1b
-ollama list                  # RECORD NAME + digest for each model
-ollama ps                    # running models
-# verify the two research models are present:
-ollama list | grep -E 'qwen3.5:2b|llama3.2:1b'
+
+# If BOTH models already exist, DO NOT pull/update them — use them as-is:
+ollama list | grep -q 'qwen3.5:2b'  && echo "qwen3.5:2b present — keep"   || ollama pull qwen3.5:2b
+ollama list | grep -q 'llama3.2:1b' && echo "llama3.2:1b present — keep"  || ollama pull llama3.2:1b
+
+# Record the EXACT digests to reuse for BOTH baseline and candidate:
+ollama list | awk 'NR==1 || /qwen3.5:2b|llama3.2:1b/ {print}' | tee -a validation/FROZEN.txt
 ```
 
-**E. ChromaDB**
+**E. ChromaDB — pinned image, ISOLATED per run (never touch existing data).**
+Do NOT `docker compose up` the existing `chromadb` service (its `chromadb_data`
+volume is your research state — the pipeline can write blocked patterns into it,
+so reusing it would let one run contaminate the next). Instead run a throwaway
+container on the SAME pinned image digest with a DEDICATED volume per run. Here
+we start the BASELINE Chroma; the candidate gets its own (see §11).
 ```bash
-docker compose up -d chromadb
+CHROMA_IMG=$(docker image inspect chromadb/chroma:latest --format '{{index .RepoDigests 0}}')
+docker volume create chroma_baseline
+docker run -d --name chroma_baseline -p 8000:8000 \
+  -e ANONYMIZED_TELEMETRY=FALSE -v chroma_baseline:/data "$CHROMA_IMG"
 curl -s http://localhost:8000/api/v2/heartbeat || curl -s http://localhost:8000/api/v1/heartbeat
-# optional: seed + confirm the collection
-npm run seed                 # seeds the security_patterns collection (if used)
+# Record the image ID actually running (must equal $CHROMA_IMG's image):
+docker inspect chroma_baseline --format '{{.Image}} {{.Config.Image}}'
+# (candidate uses a SEPARATE container/volume `chroma_candidate` — see §11)
 ```
 
-**F. Provenance**
+**F. Provenance (candidate).** The candidate tree HAS `captureEnv`:
 ```bash
-npm run captureEnv           # writes provenance.local.json
-cp provenance.local.json validation/candidate/provenance.json   # archive (see §11)
+mkdir -p validation/candidate
+npm run captureEnv                                            # writes provenance.local.json
+cp provenance.local.json validation/candidate/provenance.json
 ```
+(The baseline tree does NOT contain `scripts/captureEnvironment.js`; capture its
+provenance manually — see §11.)
 
 **G. API (production mode)**
 ```bash
@@ -200,29 +243,102 @@ APP_MODE=research npm run eval:models:qwen
 APP_MODE=research npm run eval:report
 ```
 
-**Baseline-vs-candidate (do NOT overwrite canonical results):**
+**Baseline-vs-candidate (isolated state, frozen artifacts, canonical `data/`
+never overwritten).** `REPO` = your checked-out candidate repo path. Both runs
+use the SAME frozen Ollama model digests (§D), the SAME pinned Chroma image
+(`$CHROMA_IMG`, §E/§0), and the SAME dataset — but SEPARATE Chroma volumes so
+neither can contaminate the other.
+
 ```bash
+REPO=$(pwd)                         # candidate checkout (feat/production-api)
 mkdir -p validation/baseline validation/candidate
+CHROMA_IMG=$(docker image inspect chromadb/chroma:latest --format '{{index .RepoDigests 0}}')
+```
 
-# --- BASELINE: the pre-refactor commit ---
-git worktree add /tmp/baseline 42e0ab7          # last pre-hardening commit
-cd /tmp/baseline && npm ci
-git rev-parse HEAD > <repo>/validation/baseline/COMMIT_SHA
-node scripts/captureEnvironment.js && cp provenance.local.json <repo>/validation/baseline/provenance.json
+**--- BASELINE: pre-refactor commit `42e0ab7` (no captureEnv, no committed lockfile) ---**
+```bash
+git worktree add /tmp/baseline 42e0ab7
+cd /tmp/baseline
+# Baseline has NO committed package-lock.json -> use `npm install` (not `npm ci`).
+npm install
+# Isolated, pinned ChromaDB for the baseline (dedicated volume; port 8000):
+docker rm -f chroma_baseline 2>/dev/null; docker volume rm chroma_baseline 2>/dev/null
+docker volume create chroma_baseline
+docker run -d --name chroma_baseline -p 8000:8000 -e ANONYMIZED_TELEMETRY=FALSE \
+  -v chroma_baseline:/data "$CHROMA_IMG"
+sleep 3
+npm run seed                        # seed the identical initial collection
+# MANUAL provenance (captureEnv does not exist at this commit):
+{
+  echo "{"
+  echo "  \"role\": \"baseline\","
+  echo "  \"gitCommit\": \"$(git rev-parse HEAD)\","
+  echo "  \"gitDirty\": $([ -n \"$(git status --porcelain)\" ] && echo true || echo false),"
+  echo "  \"node\": \"$(node --version)\","
+  echo "  \"npm\": \"$(npm --version)\","
+  echo "  \"ollamaVersion\": \"$(ollama --version 2>/dev/null | head -1)\","
+  echo "  \"ollamaModels\": \"$(ollama list | awk 'NR>1{print $1\"@\"$2}' | paste -sd, -)\","
+  echo "  \"gpuName\": \"$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)\","
+  echo "  \"driverVersion\": \"$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)\","
+  echo "  \"cudaVersion\": \"$(nvidia-smi | sed -n 's/.*CUDA Version: \\([0-9.]*\\).*/\\1/p' | head -1)\","
+  echo "  \"chromaImage\": \"$CHROMA_IMG\","
+  echo "  \"datasetSha256\": \"$(sha256sum data/evaluation-dataset.json | cut -d' ' -f1)\","
+  echo "  \"lockfileSha256\": \"$([ -f package-lock.json ] && sha256sum package-lock.json | cut -d' ' -f1 || echo none-committed-generated-by-npm-install)\","
+  echo "  \"researchDeps\": \"$(npm ls chromadb ollama @chroma-core/default-embed dotenv --depth=0 2>/dev/null | tr '\\n' ';')\","
+  echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+  echo "}"
+} > "$REPO/validation/baseline/provenance.json"
+git rev-parse HEAD > "$REPO/validation/baseline/COMMIT_SHA"
 npm run dataset:build && npm run eval:ablation && npm run eval:models:qwen && npm run eval:report
-cp -r data/results data/result2 <repo>/validation/baseline/          # raw + report
-cd <repo> && git worktree remove /tmp/baseline
+cp -r data/results data/result2 "$REPO/validation/baseline/"
+# Tear down baseline Chroma completely so it cannot bleed into the candidate:
+docker rm -f chroma_baseline && docker volume rm chroma_baseline
+cd "$REPO" && git worktree remove /tmp/baseline
+```
 
-# --- CANDIDATE: feat/production-api (this branch) ---
-git rev-parse HEAD > validation/candidate/COMMIT_SHA
-# reuse the Level-2 run outputs from above:
-cp -r data/results data/result2 validation/candidate/
+**--- CANDIDATE: `feat/production-api` (has captureEnv; committed lockfile) ---**
+```bash
+cd "$REPO"
+npm ci                              # candidate HAS a committed lockfile
+# Separate, isolated, pinned ChromaDB for the candidate:
+docker rm -f chroma_candidate 2>/dev/null; docker volume rm chroma_candidate 2>/dev/null
+docker volume create chroma_candidate
+docker run -d --name chroma_candidate -p 8000:8000 -e ANONYMIZED_TELEMETRY=FALSE \
+  -v chroma_candidate:/data "$CHROMA_IMG"
+sleep 3
+npm run seed                        # seed the identical initial collection
+APP_MODE=research npm run captureEnv
 cp provenance.local.json validation/candidate/provenance.json
+git rev-parse HEAD > validation/candidate/COMMIT_SHA
+APP_MODE=research npm run dataset:build && APP_MODE=research npm run eval:ablation \
+  && APP_MODE=research npm run eval:models:qwen && APP_MODE=research npm run eval:report
+cp -r data/results data/result2 validation/candidate/
+docker rm -f chroma_candidate && docker volume rm chroma_candidate
 date -u +%Y-%m-%dT%H:%M:%SZ | tee validation/baseline/timestamp validation/candidate/timestamp
 ```
 
+> Identical initial RAG collection: both runs `npm run seed` from the same frozen
+> dataset. Verify the seed logic is unchanged between the two trees; if it differs,
+> copy the candidate's `scripts/seedChromaDB.js` into the baseline worktree before
+> seeding so both start from an identical collection:
+> `git -C /tmp/baseline diff --no-index scripts/seedChromaDB.js "$REPO/scripts/seedChromaDB.js"` (or `cp`).
+
+**Equality checks (run before trusting the comparison):**
+```bash
+# Same dataset hash (baseline vs candidate provenance):
+grep datasetSha256 validation/baseline/provenance.json
+grep -i '"sha256"\|datasetSha256' validation/candidate/provenance.json   # candidate captureEnv records dataset.sha256
+# Same Ollama version + model digests:
+grep -E 'ollamaVersion|ollamaModels' validation/baseline/provenance.json
+grep -iE 'version|digest|models' validation/candidate/provenance.json
+# Same Chroma image digest used by both:
+grep chromaImage validation/baseline/provenance.json ; echo "$CHROMA_IMG"
+# Isolated Chroma state (separate volumes; both removed afterward):
+docker volume ls | grep -E 'chroma_baseline|chroma_candidate' || echo "both volumes removed (expected)"
+```
+
 Each `validation/{baseline,candidate}/` then holds: COMMIT_SHA, provenance, raw
-results, report, and timestamp. Compare per preset **C1–C5** and per category:
+results, report, timestamp. Compare per preset **C1–C5** and per category:
 Accuracy, Precision, Recall, F1, False-Positive Rate, average latency, P95 latency.
 
 **Acceptance:** C1–C5 semantics identical (already asserted by
@@ -230,8 +346,11 @@ Accuracy, Precision, Recall, F1, False-Positive Rate, average latency, P95 laten
 classifications match; aggregate model metrics show **no unexplained material
 drift** (LLM outputs are stochastic — compare aggregates/trends, not byte
 equality; latency need not match). **If material drift appears, STOP and
-investigate before merge.** Do not modify the committed canonical baseline in
-`data/` during validation — all comparison outputs live under `validation/`.
+investigate before merge.** The canonical committed results in `data/` are never
+overwritten — all comparison outputs live under `validation/` (git-ignored). If
+the equality checks show a different Ollama version, model digest, dataset hash,
+or Chroma image between the two runs, the comparison is INVALID — align them and
+re-run.
 
 ## 12. Objective merge criteria
 
