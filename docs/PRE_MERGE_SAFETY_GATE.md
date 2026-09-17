@@ -187,9 +187,19 @@ npm run eval:all:fast
 | Full unit/integration suite green (159) | ✅ TESTED |
 | Full Ollama/GPU C1–C5 numeric regression | ⛔ REQUIRES MANUAL ACTION (§6/§7) |
 
-**Recommendation: MERGE-READY for staging, conditional on the GPU C1–C5
-regression (§7) passing on the EC2 host.** All objective *code-level* safety
-criteria are met and green in CI-equivalent runs. The one outstanding gate is the
-Ollama/GPU research-parity run, which cannot be executed in this environment.
-Merge order: `chore/ci-foundation` → `feat/research-core-extraction` →
+> **CORRECTION (2026‑09‑17, pre-merge closure):** an earlier version of this
+> section called the branch merge-ready based on *local, CI-equivalent* runs. That
+> was premature — the actual GitHub Actions workflow was **RED** at that time
+> (gitleaks reported 3 findings in a test-fixture file). A local run is **not**
+> sufficient; the authoritative gate is the GitHub-hosted CI conclusion. Those
+> findings have since been investigated, classified (all non-secret test
+> fixtures / documentation example), and resolved — see
+> **`docs/PRE_MERGE_CLOSURE.md`**. Do not treat this branch as passing unless the
+> GitHub Actions run on the current commit is green.
+
+**Recommendation:** GO for the human-run GPU/CEDA‑215 validation **only once the
+actual GitHub Actions run on the final `feat/production-api` commit is green**
+(tracked in `docs/PRE_MERGE_CLOSURE.md`). The GPU/Ollama research-parity run
+cannot be executed in this environment and remains the outstanding gate before
+merge. Merge order: `chore/ci-foundation` → `feat/research-core-extraction` →
 `feat/production-api`. **Do not expose the API publicly until Phase 3 (auth).**
