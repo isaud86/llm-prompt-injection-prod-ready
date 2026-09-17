@@ -34,6 +34,26 @@ public exploit details for unpatched issues.
   This shrinks the trusted surface the production API wraps and lets production
   backends be swapped without touching research code. `IMPLEMENTED`.
 
+## API foundation controls (Phase 5, `apps/api`) — `IMPLEMENTED`
+
+- **Response DTO** (`dto/chatResponse.js`): a strict field allowlist; the raw
+  research result, internal `reasoning`/`threatCategory`/`violationType`, rule
+  evidence, `logEntry`, hidden prompts, and any model `thinking`/chain-of-thought
+  are dropped by construction. Verified by tests.
+- **Typed errors + safe handler** (`errors/ApiError.js`, `middleware/errorHandler.js`):
+  stable codes, stack traces/internals never returned; malformed JSON and
+  oversized bodies map to 400.
+- **HTTP hardening**: Helmet + strict CSP (`default-src 'none'`), strict CORS
+  allowlist, `x-powered-by` disabled, HSTS in production.
+- **Input validation**: Zod schemas with `.strict()` (unknown-key / mass-assignment
+  rejection), prompt length cap, request body size limit.
+- **Correlation ids**: per-request `requestId` (inbound honored only if well-formed)
+  across logs, errors, and the DTO.
+- **Timeouts**: end-to-end inference timeout → `INFERENCE_TIMEOUT`.
+- **Auth boundary prepared**: `middleware/auth.js` isolates the future Cognito
+  insertion point; routes/services depend only on `req.auth`. NOTE: until Phase 3,
+  the API has no authentication and must not be publicly exposed.
+
 ## Planned (built in later phases — see IMPLEMENTATION_PLAN.md)
 
 - Authentication (Cognito) + server‑side RBAC (`USER`/`RESEARCHER`/`ADMIN`).

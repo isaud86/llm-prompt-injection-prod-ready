@@ -112,6 +112,15 @@ interfaces under `providers/` (`InferenceProvider`/`OllamaInferenceProvider`,
 this barrel and never reaches into its internals. `apps/web` and `apps/worker`
 remain to be built in later phases.
 
+**Status (Phase 5 — DONE/TESTED):** `apps/api` is a runnable Express service over
+research-core with `/healthz`, `/readyz`, and `POST /api/v1/chat`. It enforces a
+response DTO (no raw result / reasoning / chain-of-thought), a typed-error
+catalogue with a safe error handler, Helmet + strict CORS + CSP, Zod validation
+with unknown-key rejection, body-size limits, per-request correlation ids, and an
+end-to-end inference timeout. The auth middleware is a boundary placeholder
+(anonymous principal) ready for Cognito in Phase 3; distributed rate limiting
+(Redis) is Phase 4. The service is not yet fit for public exposure (no auth).
+
 ### 2.2 Target logical architecture
 
 ```mermaid

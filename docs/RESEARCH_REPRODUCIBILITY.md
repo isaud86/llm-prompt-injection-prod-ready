@@ -72,6 +72,21 @@ Any change that could alter experimental outcomes is recorded here with
 **OLD behavior / NEW behavior / REASON / IMPACT ON EXPERIMENT**. If this section
 lists no entries for a code area, that area's research behavior is unchanged.
 
+### 2026‑09‑17 — Production API added (`apps/api`, Phase 5)
+
+- **WHY:** provide a production HTTP surface around research-core (brief Phase 5).
+- **PREVIOUS STRUCTURE:** no HTTP surface (REPL + scripts only).
+- **NEW STRUCTURE:** `apps/api` (Express) consuming the research-core barrel via
+  `services/pipeline.js`. New root deps: express, helmet, cors, zod (+ supertest
+  dev). New script `npm run api:start`.
+- **COMPATIBILITY IMPACT:** additive only. The REPL (`npm start`), `npm run hack`,
+  and all `eval:*` scripts are unchanged and continue to call research-core
+  directly. Adding deps updated `package-lock.json` (re-run `npm ci`).
+- **IMPACT ON EXPERIMENT:** **None.** The API is a separate consumer; it does not
+  modify research-core behavior. The C1–C5 contract test asserts the preset flag
+  sets are unchanged. Anonymous API clients cannot select a preset (full pipeline
+  only), so the API cannot alter experimental configurations.
+
 ### 2026‑09‑17 — Research core extracted to `packages/research-core` (Phase 1b)
 
 - **WHY:** isolate the scientific implementation behind a stable, framework‑free
