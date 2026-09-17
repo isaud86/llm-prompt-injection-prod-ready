@@ -72,6 +72,28 @@ Any change that could alter experimental outcomes is recorded here with
 **OLD behavior / NEW behavior / REASON / IMPACT ON EXPERIMENT**. If this section
 lists no entries for a code area, that area's research behavior is unchanged.
 
+### 2026‑09‑17 — Research core extracted to `packages/research-core` (Phase 1b)
+
+- **WHY:** isolate the scientific implementation behind a stable, framework‑free
+  public API so production apps depend on it without the research code ever
+  depending on HTTP/auth/billing/DB/cloud (brief Phase 1b).
+- **PREVIOUS STRUCTURE:** all source under `src/`; `semanticValidator`/
+  `chatbotAgent` instantiated the Ollama client directly; `ragRetriever`/
+  `longTermMemory` called `chromaClient` directly; C1–C5 presets were inline in
+  the REPL (`src/index.js`).
+- **NEW STRUCTURE:** `packages/research-core/src/**` (moved via `git mv`, history
+  preserved), public barrel `packages/research-core/index.js`, and `providers/`
+  holding `InferenceProvider`/`OllamaInferenceProvider` and
+  `VectorStore`/`ChromaVectorStore`. The four modules use the default providers
+  (identical backends). C1–C5 live in `src/presets.js` (single source of truth).
+- **COMPATIBILITY IMPACT:** `npm start`, `npm run hack`, and `eval:*` now target
+  package paths; test imports updated. Runtime paths (logs, `.env`, dataset) are
+  CWD‑relative and unchanged.
+- **IMPACT ON EXPERIMENT:** **None.** Default `OllamaInferenceProvider` and
+  `ChromaVectorStore` reproduce prior behavior exactly (same host/model, same
+  ChromaDB calls, same graceful degradation). All 106 original tests pass
+  unchanged; C1–C5 semantics are identical (definitions merely relocated).
+
 ### 2026‑09‑17 — Session/rate state made context‑aware (Phase 1)
 
 - **OLD:** `sessionMemory` used a single module‑global history array; the

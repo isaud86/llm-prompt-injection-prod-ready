@@ -28,6 +28,11 @@ public exploit details for unpatched issues.
 - **Dependency reproducibility:** `package-lock.json` committed. `IMPLEMENTED`.
 - **Environment provenance capture** for experiments. `IMPLEMENTED`
   (`scripts/captureEnvironment.js`).
+- **Research core isolation** (Phase 1b). The scientific pipeline lives in
+  `packages/research-core` with no HTTP/auth/billing/DB/cloud dependencies, and
+  infrastructure access goes through `InferenceProvider`/`VectorStore` interfaces.
+  This shrinks the trusted surface the production API wraps and lets production
+  backends be swapped without touching research code. `IMPLEMENTED`.
 
 ## Planned (built in later phases — see IMPLEMENTATION_PLAN.md)
 

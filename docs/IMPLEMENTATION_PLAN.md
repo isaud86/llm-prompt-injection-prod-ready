@@ -180,7 +180,7 @@ retention period and pseudonymization (§18, §20).
 |---|---|---|---|
 | **0** | Audit & baseline; repo hygiene; lockfile reproducibility; provenance capture; mode scaffolding | none | **DONE / TESTED** |
 | **1** | Session isolation in research core (context‑keyed session + rate state) | none | **DONE / TESTED** |
-| 1b | Extract `packages/research-core`; provider interfaces (`InferenceProvider`,`VectorStore`) | none | NOT IMPLEMENTED |
+| **1b** | Extract `packages/research-core`; provider interfaces (`InferenceProvider`,`VectorStore`) | none | **DONE / TESTED** |
 | 2 | Database + Prisma schema + migrations | Postgres (local ok) | NOT IMPLEMENTED |
 | 3 | AuthN/AuthZ (Cognito + RBAC middleware) | **Cognito** | NOT IMPLEMENTED / REQUIRES MANUAL CONFIG |
 | 4 | Redis session isolation + distributed rate limiting | Redis (local ok) | NOT IMPLEMENTED |

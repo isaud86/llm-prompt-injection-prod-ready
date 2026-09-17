@@ -104,6 +104,14 @@ The research core is **extracted and wrapped**, never rewritten:
 Migration keeps the current `src/` working until `packages/research-core`
 replaces it with green tests (strangler‑fig, not big‑bang).
 
+**Status (Phase 1b — DONE/TESTED):** `src/` has been moved into
+`packages/research-core/src/` (history preserved). The package exposes a
+framework‑free public API (`packages/research-core/index.js`) and infrastructure
+interfaces under `providers/` (`InferenceProvider`/`OllamaInferenceProvider`,
+`VectorStore`/`ChromaVectorStore`). `apps/api` (Phase 5) consumes the package via
+this barrel and never reaches into its internals. `apps/web` and `apps/worker`
+remain to be built in later phases.
+
 ### 2.2 Target logical architecture
 
 ```mermaid
