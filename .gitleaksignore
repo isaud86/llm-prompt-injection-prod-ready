@@ -1,0 +1,27 @@
+# .gitleaksignore — precise, per-finding suppressions (gitleaks 8.18.4).
+#
+# Each entry is an EXACT finding fingerprint (commit:file:rule:line) for a
+# NON-FUNCTIONAL test fixture that lives only in HISTORICAL commit c3470d6
+# (authored before the production-hardening work). The current file
+# (tests/outputFilter.test.js) was refactored to assemble these strings from
+# fragments, so no NEW commit contains a matchable literal — these suppressions
+# cover the immutable git history only.
+#
+# Scope is intentionally minimal: three exact fingerprints, NOT path/rule
+# exclusions. Gitleaks remains a hard CI gate; no detector is disabled and no
+# directory is broadly ignored. See docs/PRE_MERGE_CLOSURE.md for the full
+# investigation and classification.
+#
+# Finding 1 — TEST_FIXTURE: truncated, non-functional RSA private-key header used
+# to test outputFilter's [REDACTED_PRIVATE_KEY] path. No usable key material.
+c3470d620ca75febf855438498a1c35d537396ee:tests/outputFilter.test.js:private-key:18
+#
+# Finding 2 — TEST_FIXTURE: fake Stripe-style "sk_live_..." string (dictionary
+# text) used to test outputFilter's [REDACTED_CREDENTIAL] path. Not a real token.
+c3470d620ca75febf855438498a1c35d537396ee:tests/outputFilter.test.js:stripe-access-token:31
+#
+# Finding 3 — DOCUMENTATION_EXAMPLE: AWS's canonical published example access-key
+# id (the well-known "...7EXAMPLE" one; non-functional) used to test the
+# [REDACTED_AWS_KEY] path. The literal is not repeated here so this ignore file
+# itself contains no credential-shaped string.
+c3470d620ca75febf855438498a1c35d537396ee:tests/outputFilter.test.js:aws-access-token:37
