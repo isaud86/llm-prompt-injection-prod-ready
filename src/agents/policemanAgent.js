@@ -8,7 +8,24 @@ const config = require('../utils/config');
 const sessionMemory = require('../memory/sessionMemory');
 const longTermMemory = require('../memory/longTermMemory');
 
-const rateLimiter = new RateLimiter();
+// Per-context rate limiters (brief §8/§17: isolate rate budgets per user).
+// A context id is intended to be `${userId}:${conversationId}`. When none is
+// supplied (research CLI, evaluation scripts, existing tests), a single default
+// context is used, preserving the original single-user behavior. NOTE: this
+// in-process map is correct for a single node; the production API replaces it
+// with a distributed Redis limiter (see docs/IMPLEMENTATION_PLAN.md Phase 4).
+const DEFAULT_CONTEXT = sessionMemory.DEFAULT_CONTEXT;
+const rateLimiters = new Map();
+
+function getRateLimiter(contextId) {
+  const key = contextId || DEFAULT_CONTEXT;
+  let limiter = rateLimiters.get(key);
+  if (!limiter) {
+    limiter = new RateLimiter();
+    rateLimiters.set(key, limiter);
+  }
+  return limiter;
+}
 
 /**
  * Determine the primary violation type from a list of violations.
@@ -86,11 +103,12 @@ async function processInput(input, options = {}) {
     useMemory = true,
     useRAG = true,
     ollamaModel = null,
+    contextId = null,
   } = options;
 
   // --- Step 1: Rate limit check ---
   if (useRateLimit) {
-    const rateCheck = rateLimiter.check(input);
+    const rateCheck = getRateLimiter(contextId).check(input);
     if (!rateCheck.allowed) {
       const result = {
         status: 'VIOLATION',
@@ -117,8 +135,8 @@ async function processInput(input, options = {}) {
   // --- Step 1b: Session memory — escalation check + context ---
   let contextBlock = null;
   if (useMemory) {
-    sessionMemory.detectEscalation();
-    contextBlock = sessionMemory.formatContextBlock();
+    sessionMemory.detectEscalation(contextId);
+    contextBlock = sessionMemory.formatContextBlock(contextId);
   }
 
   // --- Step 2: Rule-based validation ---
@@ -179,7 +197,7 @@ async function processInput(input, options = {}) {
     });
 
     if (useMemory) {
-      sessionMemory.record(input, 'VIOLATION', primaryType);
+      sessionMemory.record(input, 'VIOLATION', primaryType, contextId);
       await longTermMemory.storeBlockedPattern(input, primaryType, confidence);
     }
 
@@ -218,7 +236,7 @@ async function processInput(input, options = {}) {
     });
 
     if (useMemory) {
-      sessionMemory.record(input, 'SAFE', 'none');
+      sessionMemory.record(input, 'SAFE', 'none', contextId);
     }
 
     return result;
@@ -262,17 +280,18 @@ async function processInput(input, options = {}) {
   });
 
   if (useMemory) {
-    sessionMemory.record(input, 'SAFE', 'none');
+    sessionMemory.record(input, 'SAFE', 'none', contextId);
   }
 
   return result;
 }
 
 /**
- * Reset the rate limiter (for tests).
+ * Reset all rate limiters and session memory (for tests / process reset).
+ * Clears every context so test isolation matches prior behavior.
  */
 function resetRateLimiter() {
-  rateLimiter.reset();
+  rateLimiters.clear();
   sessionMemory.reset();
 }
 

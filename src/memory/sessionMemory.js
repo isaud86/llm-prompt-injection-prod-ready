@@ -2,13 +2,41 @@ const config = require("../utils/config");
 
 const WINDOW = config.memory.sessionWindow;
 
-// Each entry: { input, status, violationType, ts }
-let history = [];
+// Context-keyed session history (brief §8: session isolation).
+//
+// History is stored per context id. A context id is intended to be
+// `${userId}:${conversationId}` in a multi-user deployment. When no context id
+// is supplied — which is the case for the research CLI, the evaluation scripts,
+// and all existing tests — a single DEFAULT_CONTEXT is used, giving byte-for-byte
+// the previous single-user behavior. This makes the change reproducibility-safe:
+// one user's conversation/security history can never influence another user's
+// requests, while the research path is unchanged (see
+// docs/RESEARCH_REPRODUCIBILITY.md §5).
+const DEFAULT_CONTEXT = "__research_default__";
+
+// Map<contextId, Array<{ input, status, violationType, ts }>>
+const store = new Map();
+
+function historyFor(contextId) {
+  const key = contextId || DEFAULT_CONTEXT;
+  let history = store.get(key);
+  if (!history) {
+    history = [];
+    store.set(key, history);
+  }
+  return history;
+}
 
 /**
- * Record the outcome of a processed turn.
+ * Record the outcome of a processed turn for a given context.
+ * @param {string} input
+ * @param {string} status
+ * @param {string} violationType
+ * @param {string} [contextId] optional `${userId}:${conversationId}`
  */
-function record(input, status, violationType) {
+function record(input, status, violationType, contextId) {
+  const key = contextId || DEFAULT_CONTEXT;
+  let history = historyFor(key);
   history.push({
     input: input.substring(0, 200),
     status,
@@ -17,25 +45,27 @@ function record(input, status, violationType) {
   });
   if (history.length > WINDOW) {
     history = history.slice(-WINDOW);
+    store.set(key, history);
   }
 }
 
 /**
- * Return a copy of the current window (oldest first).
+ * Return a copy of the current window (oldest first) for a context.
  */
-function getHistory() {
-  return [...history];
+function getHistory(contextId) {
+  return [...historyFor(contextId)];
 }
 
 /**
- * Detect multi-turn escalation patterns in the history.
+ * Detect multi-turn escalation patterns in a context's history.
  * Returns { escalating: bool, reason: string|null }.
  *
  * Patterns:
  * 1. 2+ violations in window → persistent attacker
  * 2. Safe turns followed by a violation → reconnaissance then attack
  */
-function detectEscalation() {
+function detectEscalation(contextId) {
+  const history = historyFor(contextId);
   if (history.length < 2) {
     return { escalating: false, reason: null };
   }
@@ -64,10 +94,11 @@ function detectEscalation() {
 }
 
 /**
- * Format history as a compact context block for the semantic validator prompt.
- * Returns a string or null if history is empty.
+ * Format a context's history as a compact context block for the semantic
+ * validator prompt. Returns a string or null if history is empty.
  */
-function formatContextBlock() {
+function formatContextBlock(contextId) {
+  const history = historyFor(contextId);
   if (history.length === 0) {
     return null;
   }
@@ -85,10 +116,22 @@ function formatContextBlock() {
 }
 
 /**
- * Reset history — used for test isolation.
+ * Reset history. With a contextId, clears only that context; without one,
+ * clears ALL contexts (used for test isolation, matching prior behavior).
  */
-function reset() {
-  history = [];
+function reset(contextId) {
+  if (contextId) {
+    store.delete(contextId);
+  } else {
+    store.clear();
+  }
 }
 
-module.exports = { record, getHistory, detectEscalation, formatContextBlock, reset };
+module.exports = {
+  record,
+  getHistory,
+  detectEscalation,
+  formatContextBlock,
+  reset,
+  DEFAULT_CONTEXT,
+};
