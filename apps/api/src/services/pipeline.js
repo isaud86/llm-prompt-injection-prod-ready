@@ -17,4 +17,6 @@ module.exports = {
   providers: rc.providers,
   /** Currently configured model name. */
   model: () => rc.config.ollama.model,
+  /** Resolved research-core operating mode name ("research"|"production"|"test"). */
+  modeName: () => rc.config.mode.name,
 };
