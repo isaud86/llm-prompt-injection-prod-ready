@@ -43,6 +43,13 @@ async function handleChat({ message, preset }, ctx) {
     throw new ApiError("INTERNAL_ERROR", { cause: err });
   }
 
+  // Production fail-safe: research-core signals inference unavailability with the
+  // UNAVAILABLE status (no command executed, no conversation generated). Map it to
+  // a safe typed error — never a SAFE/BLOCKED DTO.
+  if (result && result.status === "UNAVAILABLE") {
+    throw new ApiError("MODEL_UNAVAILABLE");
+  }
+
   if (result && result.status === "VIOLATION" && result.violationType === "rate_limit") {
     throw new ApiError("RATE_LIMITED");
   }

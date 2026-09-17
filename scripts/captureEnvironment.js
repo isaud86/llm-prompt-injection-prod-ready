@@ -137,6 +137,34 @@ function datasetInfo() {
   };
 }
 
+function modeInfo() {
+  // Report the EXACT effective mode the runtime resolves (safety-gate task 4):
+  // import the same config the pipeline uses, so provenance can never disagree
+  // with runtime behavior. Falls back to a raw-env snapshot if config can't load.
+  try {
+    const cfg = require("../packages/research-core/src/utils/config");
+    return {
+      name: cfg.mode.name,
+      research: cfg.mode.research,
+      production: cfg.mode.production,
+      test: cfg.mode.test,
+      failOpenOnInferenceError: cfg.mode.failOpenOnInferenceError,
+      source: "research-core/config (effective)",
+    };
+  } catch (err) {
+    return {
+      name: null,
+      error: err.message,
+      env: {
+        APP_MODE: process.env.APP_MODE || null,
+        PRODUCTION_MODE: process.env.PRODUCTION_MODE || null,
+        RESEARCH_MODE: process.env.RESEARCH_MODE || null,
+      },
+      source: "env-fallback",
+    };
+  }
+}
+
 function packageInfo() {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
@@ -155,10 +183,7 @@ const provenance = {
   gpu: gpuInfo(),
   dataset: datasetInfo(),
   package: packageInfo(),
-  mode: {
-    research: process.env.PRODUCTION_MODE === "true" ? false : true,
-    production: process.env.PRODUCTION_MODE === "true",
-  },
+  mode: modeInfo(),
   note:
     "Fields recorded as null could not be detected on this host and were not guessed. " +
     "Archive a copy of this file alongside published results.",

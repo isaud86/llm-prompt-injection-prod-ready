@@ -194,12 +194,15 @@ Manager instead of SSH.
 
 ### 2.4 Research Mode vs. Production Mode
 
-The same `research-core` runs in both modes; behavior differs by explicit flags
-so production hardening **never silently changes experimental results** (§3):
+The same `research-core` runs in both modes; behavior differs by a single
+validated flag `APP_MODE` (`research` | `production` | `test`), so production
+hardening **never silently changes experimental results** (§3). Legacy
+`RESEARCH_MODE`/`PRODUCTION_MODE` are still honored when `APP_MODE` is unset
+(both-set resolves to production with a warning).
 
-| Concern | `RESEARCH_MODE` | `PRODUCTION_MODE` |
+| Concern | `APP_MODE=research` | `APP_MODE=production` |
 |---|---|---|
-| Semantic validator when Ollama down | fail‑open (rules only) | fail‑safe (block / degrade to safe refusal) |
+| Inference unavailable (Ollama down) | fail‑OPEN: degrade to rules‑only, continue | **fail‑SAFE: pipeline returns `UNAVAILABLE`; no command execution, no conversational generation; API → `MODEL_UNAVAILABLE`** |
 | Session memory | shared/global allowed for reproducibility | strictly per `userId:conversationId` |
 | Rate limiting | in‑process (as in experiments) | distributed (Redis) |
 | Vector store | ChromaDB | pgvector (configurable) |

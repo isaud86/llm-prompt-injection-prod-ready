@@ -1,25 +1,64 @@
 require("dotenv").config();
 
-// --- Operating mode (brief §3) ---
-// Research Mode (default) preserves original experimental behavior: fail-open
-// semantic validation, shared session memory permitted, ChromaDB, command
-// execution on. Production Mode enables fail-safe behavior, strict per-user
-// isolation, and safe defaults. Setting PRODUCTION_MODE=true implies Research
-// Mode is off unless RESEARCH_MODE=true is set explicitly (not recommended on a
-// public production path). Defaulting to Research Mode guarantees that existing
-// experiments and the C1–C5 ablation are unchanged when no env is provided.
-const productionMode = process.env.PRODUCTION_MODE === "true";
-const researchMode = productionMode
-  ? process.env.RESEARCH_MODE === "true"
-  : process.env.RESEARCH_MODE !== "false";
+// --- Operating mode (brief §3; safety-gate task 4) ---
+// A SINGLE validated mode is the source of truth: APP_MODE = research | production | test.
+//   research   (default) : original experimental behavior — fail-OPEN semantic
+//                          validation (rules-only on inference error), C1–C5, etc.
+//   production            : fail-SAFE — inference errors do NOT fall through to
+//                          command execution or conversational generation.
+//   test                 : behaves like research (fail-open) for the unit suite.
+//
+// Backward-compatible migration: if APP_MODE is unset, the legacy PRODUCTION_MODE
+// / RESEARCH_MODE flags are honored so existing setups and experiments are
+// unchanged. The ambiguous combination PRODUCTION_MODE=true + RESEARCH_MODE=true
+// resolves deterministically to production (the safer choice) with a warning.
+const VALID_MODES = ["research", "production", "test"];
+
+function resolveMode(env) {
+  const raw = (env.APP_MODE || "").toLowerCase().trim();
+  if (raw) {
+    if (!VALID_MODES.includes(raw)) {
+      throw new Error(
+        `Invalid APP_MODE "${env.APP_MODE}". Expected one of: ${VALID_MODES.join(", ")}.`,
+      );
+    }
+    return raw;
+  }
+  // Legacy fallback (deprecated — prefer APP_MODE).
+  const prod = env.PRODUCTION_MODE === "true";
+  const res = env.RESEARCH_MODE === "true";
+  if (prod && res) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[config] Both PRODUCTION_MODE and RESEARCH_MODE are set; resolving to production. Prefer APP_MODE=production|research|test.",
+    );
+    return "production";
+  }
+  if (prod) return "production";
+  return "research"; // default preserves original experimental behavior
+}
+
+const modeName = resolveMode(process.env);
+const productionMode = modeName === "production";
+const researchMode = modeName === "research";
 
 const config = {
   mode: {
+    // Single source of truth; provenance capture reports this exact value.
+    name: modeName,
     research: researchMode,
     production: productionMode,
-    // Semantic validator behavior when the LLM is unavailable:
-    // research → fail open (rules only); production → fail safe.
-    failOpenOnInferenceError: researchMode && !productionMode,
+    test: modeName === "test",
+    // Semantic validator + pipeline behavior when the LLM is unavailable:
+    // production → fail SAFE; research/test → fail OPEN (rules only).
+    failOpenOnInferenceError: !productionMode,
+  },
+  // In-memory context store safeguards (safety-gate task 2). These are DEVELOPMENT
+  // safeguards to bound per-process state for session memory + rate limiters.
+  // Redis remains the PRODUCTION implementation (Phase 4) — see docs.
+  contexts: {
+    maxContexts: parseInt(process.env.MAX_CONTEXTS, 10) || 10000,
+    ttlMs: parseInt(process.env.CONTEXT_TTL_MS, 10) || 3600000, // 1 hour idle TTL
   },
   ollama: {
     host: process.env.OLLAMA_HOST || "http://127.0.0.1:11434",

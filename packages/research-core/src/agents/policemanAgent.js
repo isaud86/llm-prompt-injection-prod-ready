@@ -7,24 +7,33 @@ const { logSecurity } = require('../utils/logger');
 const config = require('../utils/config');
 const sessionMemory = require('../memory/sessionMemory');
 const longTermMemory = require('../memory/longTermMemory');
+const BoundedContextMap = require('../utils/boundedContextMap');
 
 // Per-context rate limiters (brief §8/§17: isolate rate budgets per user).
 // A context id is intended to be `${userId}:${conversationId}`. When none is
 // supplied (research CLI, evaluation scripts, existing tests), a single default
-// context is used, preserving the original single-user behavior. NOTE: this
-// in-process map is correct for a single node; the production API replaces it
-// with a distributed Redis limiter (see docs/IMPLEMENTATION_PLAN.md Phase 4).
+// context is used, preserving the original single-user behavior.
+//
+// The store is BOUNDED + TTL-swept (safety-gate task 2): a hostile flood of
+// distinct context ids cannot grow this map indefinitely; the research default
+// context is pinned so it is never evicted. This in-process map is correct for a
+// single node; the production API replaces it with a distributed Redis limiter
+// (see docs/IMPLEMENTATION_PLAN.md Phase 4).
 const DEFAULT_CONTEXT = sessionMemory.DEFAULT_CONTEXT;
-const rateLimiters = new Map();
+const rateLimiters = new BoundedContextMap({
+  maxContexts: config.contexts.maxContexts,
+  ttlMs: config.contexts.ttlMs,
+  pinnedKey: DEFAULT_CONTEXT,
+});
 
 function getRateLimiter(contextId) {
   const key = contextId || DEFAULT_CONTEXT;
-  let limiter = rateLimiters.get(key);
-  if (!limiter) {
-    limiter = new RateLimiter();
-    rateLimiters.set(key, limiter);
-  }
-  return limiter;
+  return rateLimiters.getOrCreate(key, () => new RateLimiter());
+}
+
+/** Number of live rate-limiter contexts (observability / tests). */
+function rateLimiterCount() {
+  return rateLimiters.size;
 }
 
 /**
@@ -150,6 +159,37 @@ async function processInput(input, options = {}) {
     semanticResult = await semanticValidator.analyze(input, contextBlock, { model: ollamaModel, useRAG });
   } else {
     semanticResult = { safe: true, threats: [], fallback: true };
+  }
+
+  // --- Step 3b: PRODUCTION fail-safe on inference unavailability (safety-gate task 1) ---
+  // If semantic validation was requested but the inference backend was
+  // unavailable (fallback), Production Mode must NOT continue: no command
+  // execution and no conversational generation. We return a distinct UNAVAILABLE
+  // outcome the API maps to MODEL_UNAVAILABLE. Research/Test Mode keep the
+  // original fail-OPEN (rules-only) behavior because failOpenOnInferenceError is
+  // true there — so this branch is inert for research (reproducibility preserved).
+  const inferenceUnavailable =
+    useSemantic && semanticResult.fallback === true && !config.mode.failOpenOnInferenceError;
+  if (inferenceUnavailable) {
+    const result = {
+      status: 'UNAVAILABLE',
+      violationType: 'none',
+      threatCategory: 'none',
+      confidence: 'n/a',
+      reasoning: 'Semantic inference unavailable; failing safe (production mode).',
+      output: null,
+      warningMessage: 'The AI service is temporarily unavailable. Please try again shortly.',
+    };
+    result.logEntry = logSecurity({
+      input,
+      status: 'UNAVAILABLE',
+      violationType: 'none',
+      reasoning: 'inference_unavailable_failsafe',
+      action: 'FAILED_SAFE',
+    });
+    // Deliberately NOT recorded in session memory: an infrastructure outage is
+    // not a user-behavior signal and must not pollute escalation history.
+    return result;
   }
 
   // --- Step 4: Combine results (hybrid approach) ---
@@ -295,4 +335,4 @@ function resetRateLimiter() {
   sessionMemory.reset();
 }
 
-module.exports = { processInput, resetRateLimiter };
+module.exports = { processInput, resetRateLimiter, rateLimiterCount };

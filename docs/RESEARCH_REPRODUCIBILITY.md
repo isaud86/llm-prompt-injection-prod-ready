@@ -72,6 +72,29 @@ Any change that could alter experimental outcomes is recorded here with
 **OLD behavior / NEW behavior / REASON / IMPACT ON EXPERIMENT**. If this section
 lists no entries for a code area, that area's research behavior is unchanged.
 
+### 2026‑09‑17 — Pre-merge safety gate: APP_MODE + production fail-safe + bounded contexts
+
+- **WHY:** production fail-safe correctness, bounded in-memory state, and an
+  unambiguous single mode flag (safety-gate tasks 1, 2, 4).
+- **PREVIOUS STRUCTURE:** two overlapping flags (`RESEARCH_MODE`/`PRODUCTION_MODE`);
+  production fail-safe was only in `semanticValidator` and did NOT stop the
+  pipeline (commands could still execute); session/rate maps were unbounded and
+  reads created empty contexts.
+- **NEW STRUCTURE:** single `APP_MODE=research|production|test` (legacy flags still
+  honored when unset; both-set → production + warning; invalid → error). Pipeline
+  now returns `UNAVAILABLE` in production when inference is down (no execution/
+  generation). Session/rate maps are bounded + TTL-swept via `BoundedContextMap`
+  with the research default context **pinned**; reads never allocate.
+- **COMPATIBILITY IMPACT:** additive/backward-compatible. `.env.example` documents
+  `APP_MODE` and the legacy fallback.
+- **IMPACT ON EXPERIMENT:** **None.** Default resolves to `research`
+  (`failOpenOnInferenceError=true`), so the fail-open rules-only degradation is
+  unchanged and the new production branch is inert. The research default context
+  is pinned and never evicted (single-context research runs are unaffected;
+  `MAX_CONTEXTS`/`CONTEXT_TTL_MS` defaults are far above any single experiment).
+  Regression tests assert research fail-open and production fail-safe separately;
+  all 106 original tests still pass.
+
 ### 2026‑09‑17 — Production API added (`apps/api`, Phase 5)
 
 - **WHY:** provide a production HTTP surface around research-core (brief Phase 5).

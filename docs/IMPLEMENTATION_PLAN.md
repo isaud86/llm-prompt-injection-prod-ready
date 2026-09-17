@@ -183,7 +183,7 @@ retention period and pseudonymization (§18, §20).
 | **1b** | Extract `packages/research-core`; provider interfaces (`InferenceProvider`,`VectorStore`) | none | **DONE / TESTED** |
 | 2 | Database + Prisma schema + migrations | Postgres (local ok) | NOT IMPLEMENTED |
 | 3 | AuthN/AuthZ (Cognito + RBAC middleware) | **Cognito** | NOT IMPLEMENTED / REQUIRES MANUAL CONFIG |
-| 4 | Redis session isolation + distributed rate limiting | Redis (local ok) | NOT IMPLEMENTED |
+| 4 | Redis session isolation + distributed rate limiting | Redis (local ok) | NOT IMPLEMENTED (interim: in-process maps are **bounded + TTL-swept** via `BoundedContextMap` as a dev safeguard — see `docs/PRE_MERGE_SAFETY_GATE.md`) |
 | **5** | API service: DTOs, typed errors, Helmet/CORS/CSP, Zod, `/healthz`+`/readyz` | none (local) | **DONE / TESTED** (`apps/api`) |
 | 6 | Premium Next.js frontend (all pages, i18n/RTL, a11y) | none (local) | NOT IMPLEMENTED |
 | 7 | Subscriptions + billing (`BillingProvider` + Stripe/Moyasar) | **Stripe/Moyasar** | NOT IMPLEMENTED / REQUIRES MANUAL CONFIG |

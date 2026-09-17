@@ -1,6 +1,8 @@
 const config = require("../utils/config");
+const BoundedContextMap = require("../utils/boundedContextMap");
 
 const WINDOW = config.memory.sessionWindow;
+const EMPTY = Object.freeze([]);
 
 // Context-keyed session history (brief §8: session isolation).
 //
@@ -14,17 +16,19 @@ const WINDOW = config.memory.sessionWindow;
 // docs/RESEARCH_REPRODUCIBILITY.md §5).
 const DEFAULT_CONTEXT = "__research_default__";
 
-// Map<contextId, Array<{ input, status, violationType, ts }>>
-const store = new Map();
+// Bounded, TTL-aware, context-keyed store (safety-gate task 2). Reads never
+// create entries; the research DEFAULT_CONTEXT is pinned (never evicted/expired)
+// so reproducibility is protected. NOT the production store — Redis is Phase 4.
+const store = new BoundedContextMap({
+  maxContexts: config.contexts.maxContexts,
+  ttlMs: config.contexts.ttlMs,
+  pinnedKey: DEFAULT_CONTEXT,
+});
 
-function historyFor(contextId) {
+/** Read-only view of a context's history; never allocates a new context. */
+function readHistory(contextId) {
   const key = contextId || DEFAULT_CONTEXT;
-  let history = store.get(key);
-  if (!history) {
-    history = [];
-    store.set(key, history);
-  }
-  return history;
+  return store.get(key) || EMPTY;
 }
 
 /**
@@ -36,16 +40,16 @@ function historyFor(contextId) {
  */
 function record(input, status, violationType, contextId) {
   const key = contextId || DEFAULT_CONTEXT;
-  let history = historyFor(key);
+  const history = store.getOrCreate(key, () => []);
   history.push({
     input: input.substring(0, 200),
     status,
     violationType,
     ts: Date.now(),
   });
+  // In-place trim keeps the same array reference held by the store entry.
   if (history.length > WINDOW) {
-    history = history.slice(-WINDOW);
-    store.set(key, history);
+    history.splice(0, history.length - WINDOW);
   }
 }
 
@@ -53,7 +57,7 @@ function record(input, status, violationType, contextId) {
  * Return a copy of the current window (oldest first) for a context.
  */
 function getHistory(contextId) {
-  return [...historyFor(contextId)];
+  return [...readHistory(contextId)];
 }
 
 /**
@@ -65,7 +69,7 @@ function getHistory(contextId) {
  * 2. Safe turns followed by a violation → reconnaissance then attack
  */
 function detectEscalation(contextId) {
-  const history = historyFor(contextId);
+  const history = readHistory(contextId);
   if (history.length < 2) {
     return { escalating: false, reason: null };
   }
@@ -98,7 +102,7 @@ function detectEscalation(contextId) {
  * validator prompt. Returns a string or null if history is empty.
  */
 function formatContextBlock(contextId) {
-  const history = historyFor(contextId);
+  const history = readHistory(contextId);
   if (history.length === 0) {
     return null;
   }
@@ -127,11 +131,17 @@ function reset(contextId) {
   }
 }
 
+/** Number of live contexts (for observability / tests). */
+function contextCount() {
+  return store.size;
+}
+
 module.exports = {
   record,
   getHistory,
   detectEscalation,
   formatContextBlock,
   reset,
+  contextCount,
   DEFAULT_CONTEXT,
 };
