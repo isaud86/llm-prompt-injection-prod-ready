@@ -1,0 +1,13 @@
+{
+  "name": "CEDA-1000",
+  "version": "1.0",
+  "totalRecords": 1000,
+  "safe": 500,
+  "unsafe": 500,
+  "legacyRecords": 215,
+  "extensionRecords": 785,
+  "seedDataset": "data/evaluation-dataset.json",
+  "seedSha256": "d5edbb5f28d148a333fd0b14488bbe8cd4acf506821109c259d6cf6a70a1ebab",
+  "datasetSha256": "5048d9672bfef2f2c20b320417c3c241266faabc6f1039fafa35506b20fd75bc",
+  "generator": "scripts/buildCEDA1000.js"
+}
