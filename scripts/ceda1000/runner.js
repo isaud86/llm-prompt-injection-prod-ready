@@ -421,33 +421,58 @@ async function preflight(ctx) {
     note("ollama-reachable", true, "not required (no semantic config selected)");
   }
 
-  // --- Chroma / RAG (C5) ---
+  // --- Chroma / RAG (C5): STRICTLY READ-ONLY ---
+  // The runner never starts, seeds, resets, mutates or CREATES a Chroma
+  // collection. Preflight uses a read-only lookup (listCollections /
+  // getExistingCollection) — never getOrCreateCollection — so a controlled,
+  // pre-seeded collection is a hard requirement and preflight cannot bring one
+  // into existence.
   const needRAG = configs.some((c) => c.requiresRAG);
+  const seed = (ctx.seedChromaProvenance || seedChromaProvenance)();
+  report.infra.seedChroma = seed; // provenance in all cases
   if (needRAG) {
-    let available = false;
-    try { available = await ctx.vectorStore.isAvailable(); } catch (_) { available = false; }
-    report.infra.chromaAvailable = available;
-    add("chroma-rag-available", available,
-      available ? "vector store reachable"
-        : "vector store/RAG unavailable (C5 selected). The runner never starts, seeds, resets or destroys Chroma — a controlled, pre-seeded Chroma is required.");
-    if (available && typeof ctx.vectorStore.collectionInfo === "function") {
-      let info = null;
-      try { info = await ctx.vectorStore.collectionInfo(); } catch (_) { info = null; }
-      if (info) {
-        report.infra.chromaCollectionName = info.name;
-        report.infra.chromaCollectionCount = info.count;
-      }
-      report.infra.chromaHost = ctx.config && ctx.config.chromadb && ctx.config.chromadb.host;
-      const nonEmpty = !!(info && typeof info.count === "number" && info.count > 0);
-      add("chroma-collection-seeded", nonEmpty,
-        info ? `collection "${info.name}" count=${info.count}${nonEmpty ? "" : " — empty collection means C5 has no RAG data (unseeded)"}`
-          : "collection info unavailable");
+    note("chroma-preflight-read-only", true,
+      "Chroma lookup is read-only (getExistingCollection/listCollections); getOrCreateCollection is never called");
+    report.infra.chromaHost = ctx.config && ctx.config.chromadb && ctx.config.chromadb.host;
+
+    let info = null;
+    let lookupError = null;
+    if (typeof ctx.vectorStore.collectionInfoReadOnly === "function") {
+      try { info = await ctx.vectorStore.collectionInfoReadOnly(); }
+      catch (e) { lookupError = e; }
+    } else {
+      lookupError = new Error("read-only Chroma lookup not supported by the vector store");
     }
+    report.infra.chromaAvailable = !!(info && info.exists);
+
+    if (lookupError) {
+      add("chroma-existing-collection", false, `Chroma read-only lookup failed: ${lookupError.message}`);
+    } else if (!info || !info.exists) {
+      add("chroma-existing-collection", false,
+        'Chroma collection "security_patterns" does not exist; controlled seeded collection required for C5. The runner will NOT create it.');
+    } else {
+      report.infra.chromaCollectionName = info.name;
+      report.infra.chromaCollectionCount = info.count;
+      add("chroma-existing-collection", true, `security_patterns exists`);
+      const nonEmpty = typeof info.count === "number" && info.count > 0;
+      add("chroma-collection-nonempty", nonEmpty,
+        nonEmpty ? `count=${info.count}`
+          : `collection "${info.name}" is empty (count=${info.count}); a seeded collection is required for C5`);
+    }
+
+    // seedChromaDB.js SHA is a HARD C5 gate (frozen provenance).
+    add("seed-chroma-script-sha", seed.present && seed.matches,
+      !seed.present ? "scripts/seedChromaDB.js is missing"
+        : seed.matches ? `${seed.sha256} matches frozen provenance`
+          : `scripts/seedChromaDB.js SHA ${seed.sha256} does NOT match frozen ${seed.expectedSha256}`);
   } else {
     note("chroma-rag-available", true, "not required (C5 not selected)");
+    // Non-C5: seed-script SHA is provenance only and never blocks the run.
+    note("seed-chroma-script-sha", seed.matches,
+      seed.present ? `${seed.sha256}${seed.matches ? " matches" : " differs from"} frozen provenance (informational; C5 not selected)`
+        : "scripts/seedChromaDB.js missing (informational; C5 not selected)");
   }
 
-  report.infra.seedChroma = needRAG ? seedChromaProvenance() : null;
   return report;
 }
 
@@ -762,6 +787,7 @@ function makeContext(options = {}) {
     processInput: options.processInput || agent.processInput,
     resetPipeline: options.resetPipeline || agent.resetRateLimiter,
     gitProvenance: options.gitProvenance || provenance.gitProvenance,
+    seedChromaProvenance: options.seedChromaProvenance || seedChromaProvenance,
     now: options.now || (() => Date.now()),
     logger: options.logger || (() => {}),
     _aborted: false,

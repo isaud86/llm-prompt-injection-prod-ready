@@ -97,9 +97,19 @@ function availableProviders() {
     defaultVectorStore: {
       isAvailable: async () => true,
       collectionInfo: async () => ({ name: "security_patterns", count: 215 }),
+      // Strictly read-only path used by C5 preflight:
+      collectionInfoReadOnly: async () => ({ exists: true, name: "security_patterns", count: 215 }),
+      getExistingCollection: async () => ({ name: "security_patterns", count: async () => 215 }),
+      // A spy that MUST NEVER be called during preflight (proves no mutation):
+      getOrCreateCollection: jest.fn(),
     },
   };
 }
+
+// Seed-script provenance that reports a match (the frozen SHA) — matches the real file.
+const seedMatch = () => ({ path: "scripts/seedChromaDB.js", present: true, sha256: runner.SEED_CHROMA_EXPECTED_SHA, expectedSha256: runner.SEED_CHROMA_EXPECTED_SHA, matches: true });
+const seedWrong = () => ({ path: "scripts/seedChromaDB.js", present: true, sha256: "0".repeat(64), expectedSha256: runner.SEED_CHROMA_EXPECTED_SHA, matches: false });
+const seedMissing = () => ({ path: "scripts/seedChromaDB.js", present: false, sha256: null, expectedSha256: runner.SEED_CHROMA_EXPECTED_SHA, matches: false });
 
 const cleanGit = async () => ({ commit: "abc1234", branch: "research/ceda-1000", dirty: false, describe: "abc1234" });
 
@@ -320,6 +330,7 @@ describe("preflight", () => {
       fixtureBase: fxBase,
       requireCleanGit: over.requireCleanGit !== undefined ? over.requireCleanGit : true,
       gitProvenance: over.gitProvenance || cleanGit,
+      seedChromaProvenance: over.seedChromaProvenance || seedMatch,
     });
   }
   const find = (report, name) => report.checks.find((c) => c.name === name);
@@ -413,12 +424,78 @@ describe("preflight", () => {
     expect(r.ok).toBe(false);
   });
 
-  test("#14 C5 records Chroma endpoint/collection/count", async () => {
-    const r = await runner.preflight(ctxFor("c5"));
-    expect(find(r, "chroma-rag-available").ok).toBe(true);
+  test("#14 C5 records Chroma endpoint/collection/count (read-only)", async () => {
+    const providers = availableProviders();
+    const r = await runner.preflight(ctxFor("c5", { providers }));
+    expect(find(r, "chroma-existing-collection").ok).toBe(true);
+    expect(find(r, "chroma-collection-nonempty").ok).toBe(true);
     expect(r.infra.chromaCollectionName).toBe("security_patterns");
     expect(r.infra.chromaCollectionCount).toBe(215);
-    expect(r.infra.seedChroma).toBeTruthy();
+    expect(r.infra.chromaHost).toBeTruthy();
+  });
+
+  test("C5 preflight is STRICTLY READ-ONLY — getOrCreateCollection call count = 0", async () => {
+    const providers = availableProviders();
+    const r = await runner.preflight(ctxFor("c5", { providers }));
+    expect(find(r, "chroma-preflight-read-only").ok).toBe(true);
+    expect(providers.defaultVectorStore.getOrCreateCollection).toHaveBeenCalledTimes(0);
+    expect(r.ok).toBe(true);
+  });
+
+  test("C5 fails when the collection is MISSING (never created)", async () => {
+    const providers = availableProviders();
+    providers.defaultVectorStore.collectionInfoReadOnly = async () => ({ exists: false, name: null, count: null });
+    const r = await runner.preflight(ctxFor("c5", { providers }));
+    expect(r.ok).toBe(false);
+    expect(find(r, "chroma-existing-collection").ok).toBe(false);
+    expect(find(r, "chroma-existing-collection").detail).toMatch(/does not exist/);
+    expect(providers.defaultVectorStore.getOrCreateCollection).toHaveBeenCalledTimes(0);
+  });
+
+  test("C5 fails when the collection is EMPTY (count=0)", async () => {
+    const providers = availableProviders();
+    providers.defaultVectorStore.collectionInfoReadOnly = async () => ({ exists: true, name: "security_patterns", count: 0 });
+    const r = await runner.preflight(ctxFor("c5", { providers }));
+    expect(r.ok).toBe(false);
+    expect(find(r, "chroma-collection-nonempty").ok).toBe(false);
+  });
+
+  test("C5 fails on a Chroma lookup ERROR (no collection created)", async () => {
+    const providers = availableProviders();
+    providers.defaultVectorStore.collectionInfoReadOnly = async () => { throw new Error("connection refused"); };
+    const r = await runner.preflight(ctxFor("c5", { providers }));
+    expect(r.ok).toBe(false);
+    expect(find(r, "chroma-existing-collection").ok).toBe(false);
+    expect(find(r, "chroma-existing-collection").detail).toMatch(/lookup failed|connection refused/);
+    expect(providers.defaultVectorStore.getOrCreateCollection).toHaveBeenCalledTimes(0);
+  });
+
+  test("correct seedChromaDB.js SHA passes C5; wrong SHA fails; missing fails", async () => {
+    const okR = await runner.preflight(ctxFor("c5", { seedChromaProvenance: seedMatch }));
+    expect(find(okR, "seed-chroma-script-sha").ok).toBe(true);
+    expect(okR.ok).toBe(true);
+
+    const wrongR = await runner.preflight(ctxFor("c5", { seedChromaProvenance: seedWrong }));
+    expect(find(wrongR, "seed-chroma-script-sha").ok).toBe(false);
+    expect(wrongR.ok).toBe(false);
+
+    const missingR = await runner.preflight(ctxFor("c5", { seedChromaProvenance: seedMissing }));
+    expect(find(missingR, "seed-chroma-script-sha").ok).toBe(false);
+    expect(missingR.ok).toBe(false);
+  });
+
+  test("C1-C4 are NOT blocked by a seed-script SHA mismatch", async () => {
+    const r = await runner.preflight(ctxFor("c1,c2,c3,c4", { seedChromaProvenance: seedWrong }));
+    // seed SHA is informational (not a gate) when C5 is not selected
+    expect(find(r, "seed-chroma-script-sha").ok).toBe(false); // records the mismatch...
+    expect(r.ok).toBe(true); // ...but does NOT fail preflight
+  });
+
+  test("the real frozen seedChromaDB.js SHA matches (default provenance)", async () => {
+    const seed = runner.seedChromaProvenance();
+    expect(seed.present).toBe(true);
+    expect(seed.sha256).toBe(runner.SEED_CHROMA_EXPECTED_SHA);
+    expect(seed.matches).toBe(true);
   });
 
   test("semantic config fails preflight when Ollama is unreachable", async () => {
@@ -427,14 +504,6 @@ describe("preflight", () => {
     const r = await runner.preflight(ctxFor("c3", { providers }));
     expect(r.ok).toBe(false);
     expect(find(r, "ollama-reachable").ok).toBe(false);
-  });
-
-  test("C5 fails preflight when Chroma is unavailable", async () => {
-    const providers = availableProviders();
-    providers.defaultVectorStore.isAvailable = async () => false;
-    const r = await runner.preflight(ctxFor("c5", { providers }));
-    expect(r.ok).toBe(false);
-    expect(find(r, "chroma-rag-available").ok).toBe(false);
   });
 });
 
