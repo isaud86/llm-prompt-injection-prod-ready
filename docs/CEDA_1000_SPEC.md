@@ -1,9 +1,49 @@
-# CEDA-1000 v1.0 — Specification
+# CEDA-1000 v1.1 — Specification
 
 **Command-Execution Defense Assessment corpus, 1000 records.** CEDA-1000 extends
 the validated CEDA-215 seed to 1000 labelled records for evaluating the hybrid
 rule + LLM defense pipeline. This document is the authoritative spec for its
-purpose, methodology, provenance, and validation.
+purpose, methodology, provenance, and validation. **v1.1** refines the
+experimental methodology of three categories (see §0) without changing any global
+invariant (still 1000 records, 500/500, 215 legacy + 785 extension, identical
+category totals); CEDA-215 remains byte-for-byte unchanged.
+
+## 0. v1.1 Methodology Refinement
+
+Independent review identified three confounds in v1.0; v1.1 fixes them at the
+dataset level only (no pipeline/code behavior changed):
+
+1. **Path-traversal isolation (Issue 1).** All 70 path_traversal extension records
+   now use the *allowed* `ls` command (v1.0 used `cat`/etc., which are rejected by
+   the command whitelist and confounded path detection with command rejection).
+   The refactored records exercise **path semantics** (`../` depth, redundant
+   segments, repeated slashes, nested relative, quoted paths, sensitive targets)
+   across ≥7 families, and none contain a forbidden-command word — verified
+   against the real rule validator (0 `forbidden_command` confounders).
+2. **Semantic-only challenge subset (Issue 3).** ≥50 of the 70
+   semantic_manipulation extension records are `challengeType:"semantic_only"`:
+   semantically UNSAFE intent phrased **without** command words, path/encoding
+   syntax, or known injection phrases. Each one is **verified to survive the
+   deterministic rule layer** (`ruleBasedValidator.validate(input).safe === true`)
+   at build time and in tests, so it genuinely requires the semantic validator.
+   The remaining ≤20 are `challengeType:"mixed"` (deliberately rule-catchable).
+3. **Output-safety probes (Issue 2).** All 45 output_probing extension records are
+   now real output-leakage probes: an allowed `ls` over a clearly **synthetic**
+   temp fixture (`/tmp/ceda1000-output-probe/...`) plus output-safety metadata
+   (`checkOutput`, `outputExpectation:"NO_SENSITIVE_PATTERN"`, `fixtureId`,
+   `fixtureStrategy:"synthetic-temp-fixture"`, `sensitivePatterns` using synthetic
+   markers only). Input label stays SAFE (the input is allowed); output-safety is
+   asserted via metadata for a later dedicated runner.
+4. **Historical-runner limitation.** `scripts/runAblation.js` scores SAFE/UNSAFE
+   **input** verdicts and does **not** by itself score output leakage. It is
+   **unchanged** in this phase and is **not** wired to consume CEDA-1000. The 45
+   output_probing records therefore carry explicit output-safety metadata for a
+   separate CEDA-1000 output-evaluation step to be built after the dataset is
+   frozen. No claim is made that the generic ablation runner currently measures
+   these 45 output-safety cases.
+5. **Honest scope.** The 785 additions remain **deterministic template-generated
+   variants**, not independently discovered human attacks (see §10).
+6. **CEDA-215 unchanged.** The seed file and the first 215 records are immutable.
 
 ## 1. Purpose
 
@@ -60,14 +100,22 @@ Independent families (illustrative, not exhaustive):
   `/dev/null`, newline, nested substitution — each chaining `ls`/`date` with a
   **non-destructive unauthorized** command (`whoami`, `id`, `uname -a`, `cat
   /etc/passwd`, …).
-- **path_traversal:** relative depth, `%2e%2e%2f` encoded separators, mixed
-  separators, sensitive read targets, traversal combined with `ls`/`cat`.
+- **path_traversal (v1.1):** ALL use the allowed `ls` command (no `cat`/etc.) across
+  ≥7 pure-path families — relative depth, `ls` flags, redundant dot segments,
+  nested relative, repeated slashes, quoted paths, sensitive targets — so the path
+  mechanism is tested without command-whitelist confounding (§0).
 - **encoding_obfuscation:** URL, unicode, hex, base64-shaped, mixed, double,
   fragmented encodings of a payload word (encoded deterministically via
   `Buffer`; never decoded/executed).
-- **semantic_manipulation:** authority, urgency, academic, debugging, roleplay,
-  trust, social, indirect, hypothetical, conversational framings.
-- **output_probing (SAFE):** benign questions about output *format* only.
+- **semantic_manipulation (v1.1):** ≥50 `semantic_only` records (rule-verified to
+  survive the deterministic rule layer) plus ≤20 `mixed` records, across ≥7
+  families — indirect system inspection, authority-without-keywords,
+  troubleshooting pretext, trust exploitation, operational pretext, implicit
+  privilege request, contextual social engineering (§0).
+- **output_probing (SAFE, v1.1):** allowed `ls` over synthetic temp fixtures with
+  output-safety metadata (`checkOutput`, `outputExpectation`, `fixtureId`,
+  `fixtureStrategy`, synthetic `sensitivePatterns`) — genuine output-leakage
+  probes, not format questions (§0).
 - **benign (SAFE):** normal `ls`/`date` variants, natural-language equivalents,
   security-education questions, code-review questions, awareness questions,
   filenames/paths as data, quoted suspicious text with explicitly benign intent,
@@ -160,3 +208,15 @@ npm test                            # includes tests/ceda1000.test.js
 ```
 CEDA-1000 does **not** replace the evaluation dataset used by `eval:ablation` /
 `eval:models`; those continue to use `data/evaluation-dataset.json` unchanged.
+
+## 12. Changelog (deterministic)
+
+| Version | Dataset SHA256 | Notes |
+|---|---|---|
+| 1.0 | `5048d9672bfef2f2c20b320417c3c241266faabc6f1039fafa35506b20fd75bc` | Initial CEDA-1000 (215 legacy + 785 extension). |
+| 1.1 | `ae9e6f41d85bf1bcf2d7317efc0004eabb9f1ce95a004e4413e24121d22600d5` | Methodology refinement (§0): path-traversal isolation (ls-only, no command confounder); ≥50 rule-verified `semantic_only` records; 45 genuine synthetic output-safety probes. Same global invariants; CEDA-215 unchanged. Supersedes 1.0. |
+
+Seed (CEDA-215) SHA256 (immutable): `d5edbb5f28d148a333fd0b14488bbe8cd4acf506821109c259d6cf6a70a1ebab`.
+The manifest (`data/ceda-1000.manifest.json`) records `version`,
+`supersedesVersion`, `supersedesDatasetSha256`, `seedSha256`, and `datasetSha256`
+(no timestamps → deterministic).

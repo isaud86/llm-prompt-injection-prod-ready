@@ -63,7 +63,7 @@ describe("CEDA-1000 builder", () => {
 
   test("every new record has required provenance metadata", () => {
     for (const r of dataset.slice(215)) {
-      expect(r.metadata.cedaVersion).toBe("1.0");
+      expect(r.metadata.cedaVersion).toBe("1.1");
       expect(r.metadata.source).toBe("ceda-1000-extension");
       expect(typeof r.metadata.generationMethod).toBe("string");
       expect(typeof r.metadata.familyId).toBe("string");
@@ -142,5 +142,93 @@ describe("CEDA-1000 builder", () => {
     execFileSync("node", [BUILDER], { cwd: ROOT, stdio: "ignore" });
     const sha2 = crypto.createHash("sha256").update(fs.readFileSync(OUT)).digest("hex");
     expect(sha1).toBe(sha2);
+  });
+});
+
+// ─── v1.1 methodology refinements ────────────────────────────────────────────
+const ruleValidator = require("../packages/research-core/src/validators/ruleBasedValidator");
+const FORBIDDEN_CMD_RE = /\b(rm|mv|cp|cat|chmod|chown|kill|sudo|su|wget|curl|nc|bash|sh|python|node|npm|apt|yum|systemctl|service|mkdir|rmdir|touch|find|grep|awk|sed|dd|mount|umount|ssh|scp|rsync|ping|netstat|ifconfig|ip|iptables|docker|kubectl|whoami|id|pwd|uname)\b/;
+
+describe("CEDA-1000 v1.1 methodology", () => {
+  const { seed, dataset } = freshBuild();
+  const ext = dataset.slice(215);
+  const byCat = (c) => ext.filter((r) => r.category === c);
+
+  test("dataset version is 1.1 on all new records", () => {
+    expect(ext.every((r) => r.metadata.cedaVersion === "1.1")).toBe(true);
+    expect(seed.records.every((r) => r.metadata.cedaVersion === undefined)).toBe(true); // legacy untouched
+  });
+
+  describe("path_traversal (Issue 1)", () => {
+    const path = byCat("path_traversal");
+    test("70 new records, all use ls", () => {
+      expect(path).toHaveLength(70);
+      expect(path.every((r) => /^ls\b/.test(r.input.trim()))).toBe(true);
+    });
+    test("no forbidden command word present", () => {
+      expect(path.every((r) => !FORBIDDEN_CMD_RE.test(r.input))).toBe(true);
+    });
+    test("no record is rejected by the rule layer as forbidden_command", () => {
+      for (const r of path) {
+        const v = ruleValidator.validate(r.input).violations || [];
+        expect(v.some((x) => x.type === "forbidden_command")).toBe(false);
+      }
+    });
+    test("family count >= 7", () => {
+      expect(new Set(path.map((r) => r.metadata.familyId)).size).toBeGreaterThanOrEqual(7);
+    });
+  });
+
+  describe("output_probing (Issue 2)", () => {
+    const op = byCat("output_probing");
+    test("45 new records, all SAFE input label", () => {
+      expect(op).toHaveLength(45);
+      expect(op.every((r) => r.expectedLabel === "SAFE")).toBe(true);
+    });
+    test("correct fixture/output metadata on every record", () => {
+      for (const r of op) {
+        expect(r.metadata.checkOutput).toBe(true);
+        expect(r.metadata.outputExpectation).toBe("NO_SENSITIVE_PATTERN");
+        expect(r.metadata.fixtureStrategy).toBe("synthetic-temp-fixture");
+        expect(typeof r.metadata.fixtureId).toBe("string");
+        expect(Array.isArray(r.metadata.sensitivePatterns)).toBe(true);
+        expect(r.metadata.sensitivePatterns.length).toBeGreaterThan(0);
+        expect(r.metadata.sensitivePatterns.every((p) => /^(CEDA_TEST_|CEDA_SYNTHETIC_|api_key=CEDA_TEST_)/.test(p))).toBe(true);
+      }
+    });
+    test("family count >= 5", () => {
+      expect(new Set(op.map((r) => r.metadata.familyId)).size).toBeGreaterThanOrEqual(5);
+    });
+  });
+
+  describe("semantic_manipulation (Issue 3)", () => {
+    const sm = byCat("semantic_manipulation");
+    const so = sm.filter((r) => r.metadata.challengeType === "semantic_only");
+    const mx = sm.filter((r) => r.metadata.challengeType === "mixed");
+    test("70 new records; semantic_only >= 50; total split correct", () => {
+      expect(sm).toHaveLength(70);
+      expect(so.length).toBeGreaterThanOrEqual(50);
+      expect(so.length + mx.length).toBe(70);
+      expect(sm.every((r) => r.expectedLabel === "UNSAFE")).toBe(true);
+    });
+    test("every semantic_only record SURVIVES the deterministic rule-only layer", () => {
+      for (const r of so) {
+        expect(ruleValidator.validate(r.input).safe).toBe(true);
+      }
+    });
+    test("family count >= 7", () => {
+      expect(new Set(sm.map((r) => r.metadata.familyId)).size).toBeGreaterThanOrEqual(7);
+    });
+  });
+
+  test("new extension inputs remain duplicate-free (canonical) vs legacy + each other", () => {
+    const legacyCanon = new Set(seed.records.map((r) => b.canonical(r.input)));
+    const seen = new Set();
+    for (const r of ext) {
+      const c = b.canonical(r.input);
+      expect(legacyCanon.has(c)).toBe(false);
+      expect(seen.has(c)).toBe(false);
+      seen.add(c);
+    }
   });
 });

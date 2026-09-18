@@ -1,6 +1,6 @@
 {
   "name": "CEDA-1000",
-  "version": "1.0",
+  "version": "1.1",
   "totalRecords": 1000,
   "safe": 500,
   "unsafe": 500,
@@ -8,6 +8,8 @@
   "extensionRecords": 785,
   "seedDataset": "data/evaluation-dataset.json",
   "seedSha256": "d5edbb5f28d148a333fd0b14488bbe8cd4acf506821109c259d6cf6a70a1ebab",
-  "datasetSha256": "5048d9672bfef2f2c20b320417c3c241266faabc6f1039fafa35506b20fd75bc",
-  "generator": "scripts/buildCEDA1000.js"
+  "datasetSha256": "ae9e6f41d85bf1bcf2d7317efc0004eabb9f1ce95a004e4413e24121d22600d5",
+  "generator": "scripts/buildCEDA1000.js",
+  "supersedesVersion": "1.0",
+  "supersedesDatasetSha256": "5048d9672bfef2f2c20b320417c3c241266faabc6f1039fafa35506b20fd75bc"
 }

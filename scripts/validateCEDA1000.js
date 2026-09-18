@@ -11,6 +11,9 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+// Real deterministic rule validator (read-only) — used to prove the semantic_only
+// subset survives the rule layer and that path records carry no command confounder.
+const ruleBasedValidator = require("../packages/research-core/src/validators/ruleBasedValidator");
 
 const ROOT = path.resolve(__dirname, "..");
 const SEED_PATH = path.join(ROOT, "data", "evaluation-dataset.json");
@@ -50,17 +53,27 @@ const REAL_TLDS = [
 const IP_RE = /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/;
 const DOMAIN_RE = new RegExp("\\b[a-z0-9-]+\\.(" + REAL_TLDS.join("|") + ")\\b", "i");
 
+const BASE_META = ["cedaVersion", "source", "generationMethod", "familyId", "variantIndex"];
 const META_KEYS = {
-  independent: ["cedaVersion", "source", "generationMethod", "familyId", "variantIndex"],
+  independent: BASE_META,
+  output_probing: [
+    ...BASE_META, "checkOutput", "outputExpectation", "fixtureId",
+    "fixtureStrategy", "sensitivePatterns", "fixtureMarkers",
+  ],
+  semantic_manipulation: [...BASE_META, "challengeType"],
   rate_limit_evasion: [
-    "cedaVersion", "source", "generationMethod", "familyId", "variantIndex",
-    "type", "sequenceIndex", "sequenceLength", "expectBlockAfter", "testName",
+    ...BASE_META, "type", "sequenceIndex", "sequenceLength", "expectBlockAfter", "testName",
   ],
   multi_turn_escalation: [
-    "cedaVersion", "source", "generationMethod", "familyId", "variantIndex",
-    "turnIndex", "totalTurns", "expectSafe", "sequenceName",
+    ...BASE_META, "turnIndex", "totalTurns", "expectSafe", "sequenceName",
   ],
 };
+const EXPECTED_CEDA_VERSION = "1.1";
+const SUPERSEDES_VERSION = "1.0";
+const SUPERSEDES_DATASET_SHA256 =
+  "5048d9672bfef2f2c20b320417c3c241266faabc6f1039fafa35506b20fd75bc";
+// Synthetic marker prefixes permitted in output-probe sensitivePatterns.
+const SYNTHETIC_MARKER_RE = /^(CEDA_TEST_|CEDA_SYNTHETIC_|api_key=CEDA_TEST_)/;
 const NONDETERMINISM_KEY_RE = /(timestamp|createdat|updatedat|generatedat|random|uuid|epoch|\bnow\b)/i;
 
 function sha256Hex(buf) {
@@ -139,14 +152,13 @@ function main() {
   let metaOk = true, provenanceOk = true, nondetOk = true, detMeta = "";
   for (const r of extension) {
     const m = r.metadata || {};
-    const type = r.category === "rate_limit_evasion" ? "rate_limit_evasion"
-      : r.category === "multi_turn_escalation" ? "multi_turn_escalation" : "independent";
+    const type = META_KEYS[r.category] ? r.category : "independent";
     const expectedKeys = META_KEYS[type].slice().sort();
     const actualKeys = Object.keys(m).sort();
     if (JSON.stringify(expectedKeys) !== JSON.stringify(actualKeys)) {
       metaOk = false; if (!detMeta) detMeta = `${r.id}: keys ${actualKeys.join(",")}`;
     }
-    if (m.cedaVersion !== "1.0" || m.source !== "ceda-1000-extension" ||
+    if (m.cedaVersion !== EXPECTED_CEDA_VERSION || m.source !== "ceda-1000-extension" ||
         typeof m.generationMethod !== "string" || typeof m.familyId !== "string" ||
         typeof m.variantIndex !== "number") provenanceOk = false;
     for (const k of actualKeys) if (NONDETERMINISM_KEY_RE.test(k)) nondetOk = false;
@@ -230,6 +242,65 @@ function main() {
     mtNew.filter((r) => r.expectedLabel === "SAFE").length === 19 &&
     mtNew.filter((r) => r.expectedLabel === "UNSAFE").length === 47);
 
+  // ── v1.1 methodology checks ────────────────────────────────────────────────
+  const isStateful = (c) => c === "rate_limit_evasion" || c === "multi_turn_escalation";
+  const FORBIDDEN_CMD_RE = /\b(rm|mv|cp|cat|chmod|chown|kill|sudo|su|wget|curl|nc|bash|sh|python|node|npm|apt|yum|systemctl|service|mkdir|rmdir|touch|find|grep|awk|sed|dd|mount|umount|ssh|scp|rsync|ping|netstat|ifconfig|ip|iptables|docker|kubectl|whoami|id|pwd|uname)\b/;
+
+  // PATH (Issue 1): 70 new, all use `ls`, no forbidden-command confounder, >=7 families.
+  const pathNew = extension.filter((r) => r.category === "path_traversal");
+  check("v1.1 path: 70 new records", pathNew.length === 70, `got ${pathNew.length}`);
+  check("v1.1 path: all use ls", pathNew.every((r) => /^ls\b/.test(r.input.trim())));
+  let pathConfounder = 0, pathCmd = 0, pcEx = "";
+  for (const r of pathNew) {
+    if (FORBIDDEN_CMD_RE.test(r.input)) { pathCmd++; if (!pcEx) pcEx = r.input; }
+    const v = ruleBasedValidator.validate(r.input).violations || [];
+    if (v.some((x) => x.type === "forbidden_command")) pathConfounder++;
+  }
+  check("v1.1 path: no forbidden-command word present", pathCmd === 0, `count=${pathCmd} e.g. ${pcEx}`);
+  check("v1.1 path: 0 forbidden-command confounders (rule layer)", pathConfounder === 0, `count=${pathConfounder}`);
+  check("v1.1 path: >=7 families",
+    new Set(pathNew.map((r) => r.metadata.familyId)).size >= 7,
+    `got ${new Set(pathNew.map((r) => r.metadata.familyId)).size}`);
+
+  // OUTPUT (Issue 2): 45 new, SAFE, output-safety metadata, synthetic markers, >=5 families.
+  const opNew = extension.filter((r) => r.category === "output_probing");
+  check("v1.1 output: 45 new records", opNew.length === 45, `got ${opNew.length}`);
+  check("v1.1 output: all SAFE input label", opNew.every((r) => r.expectedLabel === "SAFE"));
+  check("v1.1 output: all checkOutput === true", opNew.every((r) => r.metadata.checkOutput === true));
+  check("v1.1 output: all outputExpectation === NO_SENSITIVE_PATTERN",
+    opNew.every((r) => r.metadata.outputExpectation === "NO_SENSITIVE_PATTERN"));
+  check("v1.1 output: all have fixtureId + synthetic-temp-fixture strategy",
+    opNew.every((r) => r.metadata.fixtureId && r.metadata.fixtureStrategy === "synthetic-temp-fixture"));
+  check("v1.1 output: all have non-empty sensitivePatterns",
+    opNew.every((r) => Array.isArray(r.metadata.sensitivePatterns) && r.metadata.sensitivePatterns.length > 0));
+  check("v1.1 output: only synthetic markers",
+    opNew.every((r) => r.metadata.sensitivePatterns.every((p) => SYNTHETIC_MARKER_RE.test(p))));
+  check("v1.1 output: all use ls", opNew.every((r) => /^ls\b/.test(r.input.trim())));
+  check("v1.1 output: >=5 families",
+    new Set(opNew.map((r) => r.metadata.familyId)).size >= 5,
+    `got ${new Set(opNew.map((r) => r.metadata.familyId)).size}`);
+
+  // SEMANTIC (Issue 3): 70 new, >=50 semantic_only, each semantic_only survives the
+  // rule layer, >=7 families.
+  const smNew = extension.filter((r) => r.category === "semantic_manipulation");
+  const smOnly = smNew.filter((r) => r.metadata.challengeType === "semantic_only");
+  const smMixed = smNew.filter((r) => r.metadata.challengeType === "mixed");
+  check("v1.1 semantic: 70 new records", smNew.length === 70, `got ${smNew.length}`);
+  check("v1.1 semantic: every record has challengeType semantic_only|mixed",
+    smNew.every((r) => ["semantic_only", "mixed"].includes(r.metadata.challengeType)));
+  check("v1.1 semantic: semantic_only >= 50", smOnly.length >= 50, `got ${smOnly.length}`);
+  check("v1.1 semantic: semantic_only + mixed == 70", smOnly.length + smMixed.length === 70);
+  check("v1.1 semantic: all UNSAFE label", smNew.every((r) => r.expectedLabel === "UNSAFE"));
+  let smOnlyRuleFail = 0, srfEx = "";
+  for (const r of smOnly) {
+    if (ruleBasedValidator.validate(r.input).safe !== true) { smOnlyRuleFail++; if (!srfEx) srfEx = r.input; }
+  }
+  check("v1.1 semantic: semantic_only rule-layer failures == 0", smOnlyRuleFail === 0,
+    `count=${smOnlyRuleFail} e.g. ${srfEx}`);
+  check("v1.1 semantic: >=7 families",
+    new Set(smNew.map((r) => r.metadata.familyId)).size >= 7,
+    `got ${new Set(smNew.map((r) => r.metadata.familyId)).size}`);
+
   // Manifest (optional but validated when present).
   if (fs.existsSync(MANIFEST_PATH)) {
     const man = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8"));
@@ -239,6 +310,10 @@ function main() {
     check("manifest counts correct",
       man.totalRecords === 1000 && man.safe === 500 && man.unsafe === 500 &&
       man.legacyRecords === 215 && man.extensionRecords === 785);
+    check("manifest version == 1.1", man.version === EXPECTED_CEDA_VERSION, `got ${man.version}`);
+    check("manifest supersedesVersion == 1.0", man.supersedesVersion === SUPERSEDES_VERSION);
+    check("manifest supersedesDatasetSha256 == v1.0 sha",
+      man.supersedesDatasetSha256 === SUPERSEDES_DATASET_SHA256);
     check("manifest has no timestamp field",
       !Object.keys(man).some((k) => NONDETERMINISM_KEY_RE.test(k)));
   }
