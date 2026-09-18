@@ -1,4 +1,4 @@
-const RateLimiter = require('../src/middleware/rateLimiter');
+const RateLimiter = require('../packages/research-core/src/middleware/rateLimiter');
 
 describe('RateLimiter', () => {
   let limiter;

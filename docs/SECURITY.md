@@ -28,6 +28,31 @@ public exploit details for unpatched issues.
 - **Dependency reproducibility:** `package-lock.json` committed. `IMPLEMENTED`.
 - **Environment provenance capture** for experiments. `IMPLEMENTED`
   (`scripts/captureEnvironment.js`).
+- **Research core isolation** (Phase 1b). The scientific pipeline lives in
+  `packages/research-core` with no HTTP/auth/billing/DB/cloud dependencies, and
+  infrastructure access goes through `InferenceProvider`/`VectorStore` interfaces.
+  This shrinks the trusted surface the production API wraps and lets production
+  backends be swapped without touching research code. `IMPLEMENTED`.
+
+## API foundation controls (Phase 5, `apps/api`) — `IMPLEMENTED`
+
+- **Response DTO** (`dto/chatResponse.js`): a strict field allowlist; the raw
+  research result, internal `reasoning`/`threatCategory`/`violationType`, rule
+  evidence, `logEntry`, hidden prompts, and any model `thinking`/chain-of-thought
+  are dropped by construction. Verified by tests.
+- **Typed errors + safe handler** (`errors/ApiError.js`, `middleware/errorHandler.js`):
+  stable codes, stack traces/internals never returned; malformed JSON and
+  oversized bodies map to 400.
+- **HTTP hardening**: Helmet + strict CSP (`default-src 'none'`), strict CORS
+  allowlist, `x-powered-by` disabled, HSTS in production.
+- **Input validation**: Zod schemas with `.strict()` (unknown-key / mass-assignment
+  rejection), prompt length cap, request body size limit.
+- **Correlation ids**: per-request `requestId` (inbound honored only if well-formed)
+  across logs, errors, and the DTO.
+- **Timeouts**: end-to-end inference timeout → `INFERENCE_TIMEOUT`.
+- **Auth boundary prepared**: `middleware/auth.js` isolates the future Cognito
+  insertion point; routes/services depend only on `req.auth`. NOTE: until Phase 3,
+  the API has no authentication and must not be publicly exposed.
 
 ## Planned (built in later phases — see IMPLEMENTATION_PLAN.md)
 
@@ -56,8 +81,25 @@ instances or in images.
 
 ## Modes
 
-`RESEARCH_MODE` preserves experimental behavior (fail‑open semantic validation,
-shared session memory permitted, ChromaDB, command execution on). `PRODUCTION_MODE`
-enforces fail‑safe, strict per‑user isolation, distributed rate limiting, DTO‑only
-responses, and command execution off by default. The public production path must
-run with `PRODUCTION_MODE` and must never enable Research Mode.
+A single validated flag `APP_MODE` (`research` | `production` | `test`) selects
+behavior; legacy `RESEARCH_MODE`/`PRODUCTION_MODE` remain honored when `APP_MODE`
+is unset, and the ambiguous both-set combination resolves to `production` with a
+warning. Provenance capture reports the exact effective mode the runtime uses.
+
+- `research` (default) preserves experimental behavior: **fail‑open** semantic
+  validation (rules‑only on inference error), ChromaDB, command execution on.
+- `production` enforces **fail‑safe**: if inference is unavailable the pipeline
+  returns `UNAVAILABLE` — no command execution, no conversational generation —
+  and the API responds `MODEL_UNAVAILABLE`. Plus strict per‑user isolation and
+  safe DTO‑only responses. The public production path must run `APP_MODE=production`
+  and must never run research mode.
+- `test` behaves like research for the unit suite.
+
+### In-memory context safeguards
+
+Session memory and rate limiters are context-keyed in-process maps. As a
+development safeguard they are **bounded** (`MAX_CONTEXTS`, LRU eviction) and
+**idle-TTL swept** (`CONTEXT_TTL_MS`); reads never allocate a context, and the
+research default context is pinned (never evicted). This prevents a flood of
+distinct context ids from growing state unbounded. **Redis remains the production
+store for session/rate state (Phase 4)** — these maps are single-node only.

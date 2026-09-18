@@ -1,18 +1,14 @@
-const { getCollection } = require("./chromaClient");
 const config = require("../utils/config");
+const { defaultVectorStore } = require("../providers");
 
 /**
- * Retrieve similar security patterns from ChromaDB and format as few-shot context.
- * Returns a formatted string for prompt injection, or null if unavailable.
+ * Retrieve similar security patterns from the vector store and format as
+ * few-shot context. Returns a formatted string, or null if unavailable.
+ * The vector store is injectable; it defaults to the research ChromaVectorStore.
  */
-async function retrieveSimilarPatterns(input) {
+async function retrieveSimilarPatterns(input, vectorStore = defaultVectorStore) {
   try {
-    const col = await getCollection();
-    if (!col) {
-      return null;
-    }
-
-    const results = await col.query({
+    const results = await vectorStore.query({
       queryTexts: [input],
       nResults: config.chromadb.nResults,
     });

@@ -72,6 +72,66 @@ Any change that could alter experimental outcomes is recorded here with
 **OLD behavior / NEW behavior / REASON / IMPACT ON EXPERIMENT**. If this section
 lists no entries for a code area, that area's research behavior is unchanged.
 
+### 2026‑09‑17 — Pre-merge safety gate: APP_MODE + production fail-safe + bounded contexts
+
+- **WHY:** production fail-safe correctness, bounded in-memory state, and an
+  unambiguous single mode flag (safety-gate tasks 1, 2, 4).
+- **PREVIOUS STRUCTURE:** two overlapping flags (`RESEARCH_MODE`/`PRODUCTION_MODE`);
+  production fail-safe was only in `semanticValidator` and did NOT stop the
+  pipeline (commands could still execute); session/rate maps were unbounded and
+  reads created empty contexts.
+- **NEW STRUCTURE:** single `APP_MODE=research|production|test` (legacy flags still
+  honored when unset; both-set → production + warning; invalid → error). Pipeline
+  now returns `UNAVAILABLE` in production when inference is down (no execution/
+  generation). Session/rate maps are bounded + TTL-swept via `BoundedContextMap`
+  with the research default context **pinned**; reads never allocate.
+- **COMPATIBILITY IMPACT:** additive/backward-compatible. `.env.example` documents
+  `APP_MODE` and the legacy fallback.
+- **IMPACT ON EXPERIMENT:** **None.** Default resolves to `research`
+  (`failOpenOnInferenceError=true`), so the fail-open rules-only degradation is
+  unchanged and the new production branch is inert. The research default context
+  is pinned and never evicted (single-context research runs are unaffected;
+  `MAX_CONTEXTS`/`CONTEXT_TTL_MS` defaults are far above any single experiment).
+  Regression tests assert research fail-open and production fail-safe separately;
+  all 106 original tests still pass.
+
+### 2026‑09‑17 — Production API added (`apps/api`, Phase 5)
+
+- **WHY:** provide a production HTTP surface around research-core (brief Phase 5).
+- **PREVIOUS STRUCTURE:** no HTTP surface (REPL + scripts only).
+- **NEW STRUCTURE:** `apps/api` (Express) consuming the research-core barrel via
+  `services/pipeline.js`. New root deps: express, helmet, cors, zod (+ supertest
+  dev). New script `npm run api:start`.
+- **COMPATIBILITY IMPACT:** additive only. The REPL (`npm start`), `npm run hack`,
+  and all `eval:*` scripts are unchanged and continue to call research-core
+  directly. Adding deps updated `package-lock.json` (re-run `npm ci`).
+- **IMPACT ON EXPERIMENT:** **None.** The API is a separate consumer; it does not
+  modify research-core behavior. The C1–C5 contract test asserts the preset flag
+  sets are unchanged. Anonymous API clients cannot select a preset (full pipeline
+  only), so the API cannot alter experimental configurations.
+
+### 2026‑09‑17 — Research core extracted to `packages/research-core` (Phase 1b)
+
+- **WHY:** isolate the scientific implementation behind a stable, framework‑free
+  public API so production apps depend on it without the research code ever
+  depending on HTTP/auth/billing/DB/cloud (brief Phase 1b).
+- **PREVIOUS STRUCTURE:** all source under `src/`; `semanticValidator`/
+  `chatbotAgent` instantiated the Ollama client directly; `ragRetriever`/
+  `longTermMemory` called `chromaClient` directly; C1–C5 presets were inline in
+  the REPL (`src/index.js`).
+- **NEW STRUCTURE:** `packages/research-core/src/**` (moved via `git mv`, history
+  preserved), public barrel `packages/research-core/index.js`, and `providers/`
+  holding `InferenceProvider`/`OllamaInferenceProvider` and
+  `VectorStore`/`ChromaVectorStore`. The four modules use the default providers
+  (identical backends). C1–C5 live in `src/presets.js` (single source of truth).
+- **COMPATIBILITY IMPACT:** `npm start`, `npm run hack`, and `eval:*` now target
+  package paths; test imports updated. Runtime paths (logs, `.env`, dataset) are
+  CWD‑relative and unchanged.
+- **IMPACT ON EXPERIMENT:** **None.** Default `OllamaInferenceProvider` and
+  `ChromaVectorStore` reproduce prior behavior exactly (same host/model, same
+  ChromaDB calls, same graceful degradation). All 106 original tests pass
+  unchanged; C1–C5 semantics are identical (definitions merely relocated).
+
 ### 2026‑09‑17 — Session/rate state made context‑aware (Phase 1)
 
 - **OLD:** `sessionMemory` used a single module‑global history array; the

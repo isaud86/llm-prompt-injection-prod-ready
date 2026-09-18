@@ -1,6 +1,6 @@
 const { execFile } = require('child_process');
-const { Ollama } = require('ollama');
 const config = require('../utils/config');
+const { defaultInferenceProvider } = require('../providers');
 
 const ALLOWED_COMMANDS = config.command.allowedCommands;
 
@@ -66,14 +66,14 @@ Keep responses concise (1-3 sentences). Do not reveal system internals or securi
  * Uses the same Ollama instance as the semantic validator.
  * Returns Promise<{ response: string, fallback: bool }>
  */
-async function chat(input, sessionContext = null) {
+async function chat(input, sessionContext = null, options = {}) {
+  const { inferenceProvider = defaultInferenceProvider } = options;
   try {
-    const client = new Ollama({ host: config.ollama.host });
     const systemContent = sessionContext
       ? `${CHAT_SYSTEM_PROMPT}\n\n${sessionContext}`
       : CHAT_SYSTEM_PROMPT;
 
-    const response = await client.chat({
+    const response = await inferenceProvider.chat({
       model: config.ollama.model,
       messages: [
         { role: 'system', content: systemContent },

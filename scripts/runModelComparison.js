@@ -25,7 +25,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const policemanAgent = require('../src/agents/policemanAgent');
+const policemanAgent = require('../packages/research-core/src/agents/policemanAgent');
 
 // ─── CLI arg parsing ──────────────────────────────────────────────────────────
 

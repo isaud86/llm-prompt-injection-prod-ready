@@ -104,6 +104,23 @@ The research core is **extracted and wrapped**, never rewritten:
 Migration keeps the current `src/` working until `packages/research-core`
 replaces it with green tests (strangler‑fig, not big‑bang).
 
+**Status (Phase 1b — DONE/TESTED):** `src/` has been moved into
+`packages/research-core/src/` (history preserved). The package exposes a
+framework‑free public API (`packages/research-core/index.js`) and infrastructure
+interfaces under `providers/` (`InferenceProvider`/`OllamaInferenceProvider`,
+`VectorStore`/`ChromaVectorStore`). `apps/api` (Phase 5) consumes the package via
+this barrel and never reaches into its internals. `apps/web` and `apps/worker`
+remain to be built in later phases.
+
+**Status (Phase 5 — DONE/TESTED):** `apps/api` is a runnable Express service over
+research-core with `/healthz`, `/readyz`, and `POST /api/v1/chat`. It enforces a
+response DTO (no raw result / reasoning / chain-of-thought), a typed-error
+catalogue with a safe error handler, Helmet + strict CORS + CSP, Zod validation
+with unknown-key rejection, body-size limits, per-request correlation ids, and an
+end-to-end inference timeout. The auth middleware is a boundary placeholder
+(anonymous principal) ready for Cognito in Phase 3; distributed rate limiting
+(Redis) is Phase 4. The service is not yet fit for public exposure (no auth).
+
 ### 2.2 Target logical architecture
 
 ```mermaid
@@ -177,12 +194,15 @@ Manager instead of SSH.
 
 ### 2.4 Research Mode vs. Production Mode
 
-The same `research-core` runs in both modes; behavior differs by explicit flags
-so production hardening **never silently changes experimental results** (§3):
+The same `research-core` runs in both modes; behavior differs by a single
+validated flag `APP_MODE` (`research` | `production` | `test`), so production
+hardening **never silently changes experimental results** (§3). Legacy
+`RESEARCH_MODE`/`PRODUCTION_MODE` are still honored when `APP_MODE` is unset
+(both-set resolves to production with a warning).
 
-| Concern | `RESEARCH_MODE` | `PRODUCTION_MODE` |
+| Concern | `APP_MODE=research` | `APP_MODE=production` |
 |---|---|---|
-| Semantic validator when Ollama down | fail‑open (rules only) | fail‑safe (block / degrade to safe refusal) |
+| Inference unavailable (Ollama down) | fail‑OPEN: degrade to rules‑only, continue | **fail‑SAFE: pipeline returns `UNAVAILABLE`; no command execution, no conversational generation; API → `MODEL_UNAVAILABLE`** |
 | Session memory | shared/global allowed for reproducibility | strictly per `userId:conversationId` |
 | Rate limiting | in‑process (as in experiments) | distributed (Redis) |
 | Vector store | ChromaDB | pgvector (configurable) |

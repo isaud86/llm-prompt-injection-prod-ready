@@ -1,15 +1,15 @@
 process.env.LONG_TERM_MEMORY_ENABLED = "true";
-jest.mock("../src/rag/chromaClient", () => ({
+jest.mock("../packages/research-core/src/rag/chromaClient", () => ({
   getCollection: jest.fn(),
 }));
 
 const fs = require("fs");
 const path = require("path");
-const { getCollection } = require("../src/rag/chromaClient");
+const { getCollection } = require("../packages/research-core/src/rag/chromaClient");
 const {
   storeBlockedPattern,
   loadRecentViolations,
-} = require("../src/memory/longTermMemory");
+} = require("../packages/research-core/src/memory/longTermMemory");
 
 describe("longTermMemory", () => {
   beforeEach(() => {

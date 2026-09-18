@@ -12,7 +12,7 @@ jest.mock("chromadb", () => {
 });
 
 const { ChromaClient, __mockClient, __mockCollection } = require("chromadb");
-const { getCollection, _reset } = require("../src/rag/chromaClient");
+const { getCollection, _reset } = require("../packages/research-core/src/rag/chromaClient");
 
 describe("chromaClient", () => {
   beforeEach(() => {

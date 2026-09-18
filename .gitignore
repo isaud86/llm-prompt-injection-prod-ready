@@ -15,6 +15,10 @@ logs/
 # Environment provenance is regenerated per-run; keep the schema, not the capture
 provenance.local.json
 
+# GPU/CEDA-215 validation artifacts (baseline-vs-candidate); generated on the
+# validation host, never committed (see docs/PRE_MERGE_CLOSURE.md).
+validation/
+
 # NOTE: package-lock.json is intentionally NOT ignored.
 # It is committed to guarantee dependency reproducibility for the research
 # experiments (see docs/RESEARCH_REPRODUCIBILITY.md).

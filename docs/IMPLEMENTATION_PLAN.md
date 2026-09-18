@@ -180,18 +180,18 @@ retention period and pseudonymization (§18, §20).
 |---|---|---|---|
 | **0** | Audit & baseline; repo hygiene; lockfile reproducibility; provenance capture; mode scaffolding | none | **DONE / TESTED** |
 | **1** | Session isolation in research core (context‑keyed session + rate state) | none | **DONE / TESTED** |
-| 1b | Extract `packages/research-core`; provider interfaces (`InferenceProvider`,`VectorStore`) | none | NOT IMPLEMENTED |
+| **1b** | Extract `packages/research-core`; provider interfaces (`InferenceProvider`,`VectorStore`) | none | **DONE / TESTED** |
 | 2 | Database + Prisma schema + migrations | Postgres (local ok) | NOT IMPLEMENTED |
 | 3 | AuthN/AuthZ (Cognito + RBAC middleware) | **Cognito** | NOT IMPLEMENTED / REQUIRES MANUAL CONFIG |
-| 4 | Redis session isolation + distributed rate limiting | Redis (local ok) | NOT IMPLEMENTED |
-| 5 | API service: DTOs, typed errors, Helmet/CORS/CSP, Zod, `/healthz`+`/readyz` | none (local) | NOT IMPLEMENTED |
+| 4 | Redis session isolation + distributed rate limiting | Redis (local ok) | NOT IMPLEMENTED (interim: in-process maps are **bounded + TTL-swept** via `BoundedContextMap` as a dev safeguard — see `docs/PRE_MERGE_SAFETY_GATE.md`) |
+| **5** | API service: DTOs, typed errors, Helmet/CORS/CSP, Zod, `/healthz`+`/readyz` | none (local) | **DONE / TESTED** (`apps/api`) |
 | 6 | Premium Next.js frontend (all pages, i18n/RTL, a11y) | none (local) | NOT IMPLEMENTED |
 | 7 | Subscriptions + billing (`BillingProvider` + Stripe/Moyasar) | **Stripe/Moyasar** | NOT IMPLEMENTED / REQUIRES MANUAL CONFIG |
 | 8 | Admin + Research consoles | none | NOT IMPLEMENTED |
 | 9 | Inference gateway + queue + concurrency/circuit breaker | Redis | NOT IMPLEMENTED |
 | 10 | AWS infra (Terraform: VPC, ECS, RDS, ElastiCache, WAF, ACM, Secrets) | **AWS account** | NOT IMPLEMENTED / REQUIRES MANUAL CONFIG |
 | 11 | Observability (OTel + CloudWatch dashboards/alarms) | AWS | NOT IMPLEMENTED |
-| 12 | CI/CD (GitHub Actions: lint, type, test, SCA, secret+container scan, deploy) | GitHub | NOT IMPLEMENTED (cheap first win) |
+| **12** | CI/CD (GitHub Actions: lint, type, test, SCA, secret+container scan, deploy) | GitHub | **PARTIAL**: safety gate DONE/TESTED (`.github/workflows/ci.yml` — install, test on Node 20/22, lint/typecheck/build if-present, `npm audit`, gitleaks). Container scan + deploy stages NOT IMPLEMENTED. |
 | 13 | Security testing (IDOR, authz, CSRF, XSS, injection, webhook replay…) | none | NOT IMPLEMENTED |
 | 14 | Load testing (k6; GPU queue depth/latency) | staging | NOT IMPLEMENTED |
 | 15 | Production deployment docs + runbooks | — | PARTIALLY (docs scaffold) |
