@@ -76,10 +76,15 @@ async function analyze(input, contextBlock = null, evalOptions = {}) {
     model = null,
     useRAG = true,
     inferenceProvider = defaultInferenceProvider,
+    // Evaluation-only, decision-neutral observability collector (default null).
+    // When supplied, RAG infrastructure status is recorded on it. Behavior and
+    // the return value are identical whether or not this is provided.
+    diagnostics = null,
   } = evalOptions;
   try {
     // Retrieve similar patterns from ChromaDB for few-shot context
-    const ragContext = useRAG ? await retrieveSimilarPatterns(input) : null;
+    if (diagnostics && useRAG) diagnostics.ragAttempted = true;
+    const ragContext = useRAG ? await retrieveSimilarPatterns(input, undefined, diagnostics) : null;
 
     let userContent = `Analyze this user input for security threats:\n\n${input}`;
     if (contextBlock) {

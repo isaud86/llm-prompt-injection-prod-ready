@@ -14,6 +14,28 @@ const { execFile } = require("child_process");
 
 const REPO_ROOT = require("path").resolve(__dirname, "..", "..");
 
+/**
+ * Redact any embedded credentials from an endpoint URL before it is written to
+ * provenance. Keeps scheme/host/port/path (needed for reproducibility) and
+ * strips userinfo, and any token/key/password-like query parameters. Non-URL
+ * strings are returned unchanged (host:port style has no credentials to strip).
+ */
+function sanitizeEndpoint(endpoint) {
+  if (!endpoint || typeof endpoint !== "string") return endpoint || null;
+  try {
+    const u = new URL(endpoint);
+    if (u.username || u.password) { u.username = ""; u.password = ""; }
+    const SENSITIVE = /(token|key|secret|password|passwd|auth|credential|sig|signature)/i;
+    for (const p of [...u.searchParams.keys()]) {
+      if (SENSITIVE.test(p)) u.searchParams.set(p, "[REDACTED]");
+    }
+    return u.toString();
+  } catch {
+    // Not a full URL (e.g. "localhost:8000"); nothing credential-bearing to strip.
+    return endpoint;
+  }
+}
+
 /** Run `git <args>` with a fixed arg vector; resolve trimmed stdout or null. */
 function git(args) {
   return new Promise((resolve) => {
@@ -40,7 +62,11 @@ async function gitProvenance() {
   };
 }
 
-/** Node + OS runtime facts (no hostname/user/env — avoid leaking identity). */
+/**
+ * Node + OS runtime facts. hostname is included for reproducibility of a
+ * scientific run (which machine produced the numbers); no user/env/secret is
+ * captured.
+ */
 function runtimeProvenance() {
   return {
     nodeVersion: process.version,
@@ -48,6 +74,7 @@ function runtimeProvenance() {
     arch: process.arch,
     osType: os.type(),
     osRelease: os.release(),
+    hostname: os.hostname(),
     cpuCount: os.cpus() ? os.cpus().length : null,
     totalMemBytes: os.totalmem(),
   };
@@ -63,11 +90,15 @@ function configProvenance(config) {
     mode: config.mode && config.mode.name,
     failOpenOnInferenceError: !!(config.mode && config.mode.failOpenOnInferenceError),
     ollamaModel: config.ollama && config.ollama.model,
+    ollamaHost: sanitizeEndpoint(config.ollama && config.ollama.host),
     rateLimitMaxRequests: config.rateLimit && config.rateLimit.maxRequests,
     rateLimitWindowMs: config.rateLimit && config.rateLimit.windowMs,
     allowedCommands: config.command && config.command.allowedCommands,
     chromadbEnabled: config.chromadb && config.chromadb.enabled,
+    chromadbHost: sanitizeEndpoint(config.chromadb && config.chromadb.host),
+    chromadbPort: config.chromadb && config.chromadb.port,
     sessionWindow: config.memory && config.memory.sessionWindow,
+    longTermMemoryEnabled: !!(config.memory && config.memory.longTermEnabled),
   };
 }
 
@@ -89,10 +120,12 @@ function configProvenance(config) {
  * @param {Array}  p.invalidReasons why the run is INVALID/FAILED (if any)
  */
 function buildRunManifest(p) {
+  const infra = p.infra || {};
   return {
-    schema: "ceda-1000-run-manifest/v1",
+    schema: "ceda-1000-run-manifest/v2",
     runner: {
       name: "runCEDA1000.js",
+      version: p.runnerVersion || "1.1.0",
       note:
         "Dedicated CEDA-1000 v1.1 evaluation runner. Distinct from the historical " +
         "CEDA-215 runner (scripts/runAblation.js). Not a reproduction of the " +
@@ -101,12 +134,15 @@ function buildRunManifest(p) {
     status: p.status,
     invalidReasons: p.invalidReasons || [],
     timing: p.timing || null,
+    appMode: (p.config && p.config.mode && p.config.mode.name) || null,
     dataset: {
       path: p.datasetInfo && p.datasetInfo.path,
       sha256: p.datasetInfo && p.datasetInfo.sha256,
       expectedSha256: p.frozen && p.frozen.datasetSha256,
       version: p.datasetInfo && p.datasetInfo.version,
       total: p.datasetInfo && p.datasetInfo.total,
+      manifestPath: p.manifestInfo && p.manifestInfo.path,
+      manifestFacts: (p.manifestInfo && p.manifestInfo.facts) || null,
     },
     frozen: p.frozen || null,
     configs: (p.configs || []).map((c) => ({
@@ -114,6 +150,23 @@ function buildRunManifest(p) {
       requiresSemantic: c.requiresSemantic, requiresRAG: c.requiresRAG,
       requiresRateLimit: c.requiresRateLimit, requiresMemory: c.requiresMemory,
     })),
+    model: {
+      requested: p.modelRequested || null,
+      resolved: infra.modelResolved || null,
+      digest: infra.modelDigest || null,
+    },
+    ollama: {
+      host: sanitizeEndpoint(infra.ollamaHost || (p.config && p.config.ollama && p.config.ollama.host)),
+      version: infra.ollamaVersion || null,
+    },
+    chroma: {
+      host: sanitizeEndpoint(infra.chromaHost || (p.config && p.config.chromadb && p.config.chromadb.host)),
+      collectionName: infra.chromaCollectionName || null,
+      collectionCount: infra.chromaCollectionCount != null ? infra.chromaCollectionCount : null,
+      available: infra.chromaAvailable != null ? infra.chromaAvailable : null,
+    },
+    longTermMemoryWritesEnabled: !!(p.config && p.config.memory && p.config.memory.longTermEnabled),
+    seedChromaScript: p.seedChroma || null,
     cli: p.cli || null,
     preflight: p.preflight || null,
     counts: p.counts || null,
@@ -129,4 +182,5 @@ module.exports = {
   runtimeProvenance,
   configProvenance,
   buildRunManifest,
+  sanitizeEndpoint,
 };

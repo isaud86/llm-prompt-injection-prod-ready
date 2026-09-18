@@ -113,12 +113,45 @@ async function processInput(input, options = {}) {
     useRAG = true,
     ollamaModel = null,
     contextId = null,
+    // Evaluation-only, decision-neutral observability. Default OFF: when false
+    // the result contract is byte-for-byte identical to the historical pipeline
+    // (no `diagnostics` field is added). When true, a `diagnostics` object is
+    // attached to EVERY return path recording facts the pipeline already knows
+    // (semantic requested/attempted/fallback/succeeded, RAG query status, and
+    // any short-circuit before semantic). This never changes SAFE/UNSAFE
+    // decisions, prompts, thresholds, or execution — it only exposes state.
+    captureEvaluationDiagnostics = false,
   } = options;
+
+  const diag = captureEvaluationDiagnostics
+    ? {
+        semanticRequested: useSemantic === true,
+        semanticAttempted: false,
+        semanticFallback: false,
+        semanticSucceeded: false,
+        shortCircuitedBeforeSemantic: false,
+        shortCircuitReason: null,
+        ragRequested: useRAG === true,
+        ragAttempted: false,
+        ragQuerySucceeded: false,
+        ragHadMatches: false,
+        ragUnavailable: false,
+        ragQueryFailed: false,
+      }
+    : null;
+  const finalize = (result) => {
+    if (diag) result.diagnostics = diag;
+    return result;
+  };
 
   // --- Step 1: Rate limit check ---
   if (useRateLimit) {
     const rateCheck = getRateLimiter(contextId).check(input);
     if (!rateCheck.allowed) {
+      if (diag) {
+        diag.shortCircuitedBeforeSemantic = true;
+        diag.shortCircuitReason = 'rate_limit';
+      }
       const result = {
         status: 'VIOLATION',
         violationType: 'rate_limit',
@@ -137,7 +170,7 @@ async function processInput(input, options = {}) {
         reasoning: rateCheck.reason,
         action: 'BLOCKED',
       });
-      return result;
+      return finalize(result);
     }
   }
 
@@ -156,9 +189,23 @@ async function processInput(input, options = {}) {
   // --- Step 3: Semantic validation (Ollama) with session context ---
   let semanticResult;
   if (useSemantic) {
-    semanticResult = await semanticValidator.analyze(input, contextBlock, { model: ollamaModel, useRAG });
+    semanticResult = await semanticValidator.analyze(input, contextBlock, {
+      model: ollamaModel,
+      useRAG,
+      diagnostics: diag, // evaluation-only; null unless capture enabled
+    });
   } else {
     semanticResult = { safe: true, threats: [], fallback: true };
+  }
+
+  // Record semantic diagnostics from the result the pipeline already has, on
+  // every downstream path (conversational, no-command, command, violation).
+  // Note: when useSemantic is false the synthetic fallback:true above is NOT a
+  // real inference fallback, so semanticAttempted stays false and it is ignored.
+  if (diag) {
+    diag.semanticAttempted = useSemantic === true;
+    diag.semanticFallback = useSemantic === true && semanticResult.fallback === true;
+    diag.semanticSucceeded = diag.semanticAttempted && !diag.semanticFallback;
   }
 
   // --- Step 3b: PRODUCTION fail-safe on inference unavailability (safety-gate task 1) ---
@@ -189,7 +236,7 @@ async function processInput(input, options = {}) {
     });
     // Deliberately NOT recorded in session memory: an infrastructure outage is
     // not a user-behavior signal and must not pollute escalation history.
-    return result;
+    return finalize(result);
   }
 
   // --- Step 4: Combine results (hybrid approach) ---
@@ -241,7 +288,7 @@ async function processInput(input, options = {}) {
       await longTermMemory.storeBlockedPattern(input, primaryType, confidence);
     }
 
-    return result;
+    return finalize(result);
   }
 
   // --- Step 5: Extract and execute commands ---
@@ -279,7 +326,7 @@ async function processInput(input, options = {}) {
       sessionMemory.record(input, 'SAFE', 'none', contextId);
     }
 
-    return result;
+    return finalize(result);
   }
 
   // Execute all extracted (safe) commands
@@ -323,7 +370,7 @@ async function processInput(input, options = {}) {
     sessionMemory.record(input, 'SAFE', 'none', contextId);
   }
 
-  return result;
+  return finalize(result);
 }
 
 /**

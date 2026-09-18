@@ -29,6 +29,19 @@ class ChromaVectorStore extends VectorStore {
   async isAvailable() {
     return (await this.getCollection()) !== null;
   }
+
+  /**
+   * Read-only collection provenance: { name, count } or null when unavailable.
+   * Uses the same collection handle the RAG read path already uses; does not
+   * seed, mutate, reset or delete the collection.
+   */
+  async collectionInfo() {
+    const col = await this.getCollection();
+    if (!col) return null;
+    let count = null;
+    try { count = await col.count(); } catch { count = null; }
+    return { name: col.name || null, count };
+  }
 }
 
 module.exports = ChromaVectorStore;

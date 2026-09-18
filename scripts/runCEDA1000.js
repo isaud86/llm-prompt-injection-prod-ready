@@ -169,12 +169,31 @@ async function main() {
   const { dataset, datasetInfo } = loaded;
   const classified = runner.classifyRecords(dataset);
 
+  // Manifest integrity gate (hard, before evaluation). Also cross-checked
+  // against the dataset SHA below. Abort — never warn-and-continue.
+  const manifestPath = path.join(path.dirname(datasetPath), "ceda-1000.manifest.json");
+  let manifestInfo;
+  try { manifestInfo = runner.loadManifest(manifestPath).manifestInfo; }
+  catch (e) {
+    if (e instanceof runner.DatasetIntegrityError) {
+      console.error(`\nMANIFEST INTEGRITY GATE FAILED\n${e.message}\n`);
+      return EXIT.DATASET;
+    }
+    throw e;
+  }
+  if (manifestInfo.facts.datasetSha256 !== datasetInfo.sha256) {
+    console.error(`\nMANIFEST/DATASET DISAGREE\n  manifest.datasetSha256=${manifestInfo.facts.datasetSha256}\n  dataset file sha=${datasetInfo.sha256}\n`);
+    return EXIT.DATASET;
+  }
+
   const ctx = runner.makeContext({
     configs, model,
-    datasetPath, datasetInfo,
+    datasetPath, manifestPath, datasetInfo,
     outputDir: opts.outputDir,
     overwrite: opts.overwrite,
     verbose: opts.verbose,
+    // Preflight (standalone or before a real run) enforces a clean working tree.
+    requireCleanGit: !opts.dryRun,
     logger: opts.verbose ? (m) => console.log(`  ${m}`) : (() => {}),
   });
   ctx.cliSnapshot = sanitizedCli(opts, configs, model);
@@ -241,7 +260,7 @@ async function main() {
 
   let results;
   try {
-    results = await runner.runEvaluation(ctx, { dataset });
+    results = await runner.runEvaluation(ctx, { dataset, manifestInfo });
   } catch (e) {
     if (e instanceof runner.PreflightError) {
       console.error(`\nPREFLIGHT FAILED — run aborted (no results written)\n${e.message}\n`);

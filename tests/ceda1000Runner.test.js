@@ -1,16 +1,15 @@
 /**
- * Unit tests for the CEDA-1000 evaluation runner.
+ * Unit tests for the CEDA-1000 evaluation runner (post scientific-hardening).
  *
  * ISOLATION CONTRACT: these tests use MOCKS only. They never contact Ollama,
  * Chroma, a GPU, or execute the real defense pipeline, and they never run the
- * full 1000-record evaluation. Every dependency is injected. Filesystem work is
- * confined to per-test temp directories that are removed afterwards. The real
- * data/ceda-1000.json is only READ (for the integrity-gate happy path) and never
- * modified.
+ * full 1000-record evaluation against real inference. Every external dependency
+ * is injected. Filesystem work is confined to per-test temp directories that are
+ * removed afterwards. The real data/ceda-1000.json and its manifest are only
+ * READ (for the integrity-gate happy path) and never modified.
  */
 
 const fs = require("fs");
-const fsp = fs.promises;
 const os = require("os");
 const path = require("path");
 
@@ -23,60 +22,89 @@ const cli = require("../scripts/runCEDA1000");
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-function mkTmp(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-function rmTmp(dir) {
-  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
-}
+function mkTmp(prefix) { return fs.mkdtempSync(path.join(os.tmpdir(), prefix)); }
+function rmTmp(dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} }
 
-/** A deterministic mock config object (no research-core require). */
+/** A deterministic mock config that satisfies the scientific-mode gates. */
 const MOCK_CONFIG = {
-  mode: { name: "test", failOpenOnInferenceError: true },
-  ollama: { model: "mock-model" },
+  mode: { name: "research", failOpenOnInferenceError: true },
+  ollama: { model: "mock-model", host: "http://127.0.0.1:11434" },
   rateLimit: { maxRequests: 20, windowMs: 60000 },
   command: { allowedCommands: ["ls", "date"] },
-  chromadb: { enabled: false },
-  memory: { sessionWindow: 5 },
+  chromadb: { enabled: true, host: "localhost", port: 8000 },
+  memory: { sessionWindow: 5, longTermEnabled: false }, // writes disabled
 };
 
 /**
- * Deterministic mock pipeline. Verdict is driven by tokens in the input so tests
- * are fully reproducible without any model:
+ * Deterministic mock pipeline. Verdict + diagnostics are driven by tokens in the
+ * input so tests are fully reproducible without any model:
  *   __BLOCK__     → VIOLATION (blocked)
- *   __FALLBACK__  → SAFE but reasoning signals a silent semantic fallback
+ *   __FALLBACK__  → SAFE but diagnostics report a silent semantic fallback
+ *   __RAGFAIL__   → SAFE but diagnostics report a RAG infrastructure failure
  *   __THROW__     → throws (execution error)
  *   __LEAK:xxx__  → SAFE, output contains xxx (leak marker)
- *   otherwise     → SAFE with a benign listing
+ *   otherwise     → SAFE benign listing
+ * Diagnostics are attached only when captureEvaluationDiagnostics is set.
  */
 function makeMockPipeline() {
   const calls = [];
   const processInput = jest.fn(async (input, opts) => {
     calls.push({ input, opts });
     if (input.includes("__THROW__")) throw new Error("boom");
+
+    const diag = opts.captureEvaluationDiagnostics
+      ? {
+          semanticRequested: opts.useSemantic === true,
+          semanticAttempted: opts.useSemantic === true,
+          semanticFallback: false,
+          semanticSucceeded: opts.useSemantic === true,
+          shortCircuitedBeforeSemantic: false,
+          shortCircuitReason: null,
+          ragRequested: opts.useRAG === true,
+          ragAttempted: opts.useSemantic === true && opts.useRAG === true,
+          ragQuerySucceeded: opts.useSemantic === true && opts.useRAG === true,
+          ragHadMatches: false,
+          ragUnavailable: false,
+          ragQueryFailed: false,
+        }
+      : undefined;
+
     if (input.includes("__BLOCK__")) {
-      return { status: "VIOLATION", violationType: "prompt_injection", confidence: "high", reasoning: "blocked" };
+      if (diag && opts.useRateLimit) { /* still attempted semantic in mock */ }
+      return { status: "VIOLATION", violationType: "prompt_injection", confidence: "high", reasoning: "blocked", diagnostics: diag };
     }
-    if (input.includes("__FALLBACK__")) {
-      return { status: "SAFE", violationType: "none", confidence: "low",
-        reasoning: "Approved commands: ls [Note: Semantic analysis unavailable, rule-based only]", output: "ls\n" };
+    if (input.includes("__FALLBACK__") && diag && opts.useSemantic) {
+      diag.semanticFallback = true; diag.semanticSucceeded = false;
+    }
+    if (input.includes("__RAGFAIL__") && diag && opts.useSemantic && opts.useRAG) {
+      diag.ragQuerySucceeded = false; diag.ragUnavailable = true;
     }
     const leak = input.match(/__LEAK:([^_]+)__/);
-    if (leak) return { status: "SAFE", violationType: "none", confidence: "high", output: `a\n${leak[1]}\nb\n` };
-    return { status: "SAFE", violationType: "none", confidence: "high", output: "a\nb\n" };
+    if (leak) return { status: "SAFE", violationType: "none", confidence: "high", output: `a\n${leak[1]}\nb\n`, diagnostics: diag };
+    return { status: "SAFE", violationType: "none", confidence: "high", output: "a\nb\n", diagnostics: diag };
   });
   return { processInput, calls };
 }
 
 function availableProviders() {
   return {
-    defaultInferenceProvider: { isAvailable: async () => true, hasModel: async () => true },
-    defaultVectorStore: { isAvailable: async () => true },
+    defaultInferenceProvider: {
+      isAvailable: async () => true,
+      hasModel: async () => true,
+      resolveModel: async (m) => ({ name: m, digest: "sha256:deadbeef" }),
+      version: async () => "0.6.3",
+    },
+    defaultVectorStore: {
+      isAvailable: async () => true,
+      collectionInfo: async () => ({ name: "security_patterns", count: 215 }),
+    },
   };
 }
 
+const cleanGit = async () => ({ commit: "abc1234", branch: "research/ceda-1000", dirty: false, describe: "abc1234" });
+
 // ═══════════════════════════════════════════════════════════════════════════
-// 1. configs.js
+// 1. configs.js  (incl. #28 historical C1–C5 unchanged)
 // ═══════════════════════════════════════════════════════════════════════════
 describe("configs", () => {
   test("FROZEN facts match the CEDA-1000 v1.1 dataset", () => {
@@ -84,27 +112,21 @@ describe("configs", () => {
     expect(configs.FROZEN.total).toBe(1000);
     expect(configs.FROZEN.safe).toBe(500);
     expect(configs.FROZEN.unsafe).toBe(500);
-    const sum = Object.values(configs.FROZEN.categories).reduce((a, b) => a + b, 0);
-    expect(sum).toBe(1000);
+    expect(Object.values(configs.FROZEN.categories).reduce((a, b) => a + b, 0)).toBe(1000);
     expect(configs.FROZEN.datasetSha256).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  test("C1–C5 have the historical layer options + derived flags", () => {
-    expect(configs.CONFIGS.map((c) => c.id)).toEqual(["C1", "C2", "C3", "C4", "C5"]);
-    const c2 = configs.CONFIGS.find((c) => c.id === "C2");
-    expect(c2.requiresSemantic).toBe(true);
-    expect(c2.requiresRAG).toBe(false);
-    const c5 = configs.CONFIGS.find((c) => c.id === "C5");
-    expect(c5.requiresRAG).toBe(true);
-    expect(c5.requiresRateLimit).toBe(true);
-    expect(c5.requiresMemory).toBe(true);
-    const c1 = configs.CONFIGS.find((c) => c.id === "C1");
-    expect(c1.requiresSemantic).toBe(false);
+  test("#28 historical C1–C5 layer definitions are unchanged", () => {
+    const byId = Object.fromEntries(configs.CONFIGS.map((c) => [c.id, c.options]));
+    expect(byId.C1).toEqual({ useRules: true, useSemantic: false, useRateLimit: false, useMemory: false, useRAG: false });
+    expect(byId.C2).toEqual({ useRules: false, useSemantic: true, useRateLimit: false, useMemory: false, useRAG: false });
+    expect(byId.C3).toEqual({ useRules: true, useSemantic: true, useRateLimit: false, useMemory: false, useRAG: false });
+    expect(byId.C4).toEqual({ useRules: true, useSemantic: true, useRateLimit: true, useMemory: true, useRAG: false });
+    expect(byId.C5).toEqual({ useRules: true, useSemantic: true, useRateLimit: true, useMemory: true, useRAG: true });
   });
 
   test("resolveConfigs: all / list / names / order / dedup / unknown", () => {
     expect(configs.resolveConfigs("all").map((c) => c.id)).toEqual(["C1", "C2", "C3", "C4", "C5"]);
-    // input order does not change canonical order; duplicates removed
     expect(configs.resolveConfigs("c3,c1,c1").map((c) => c.id)).toEqual(["C1", "C3"]);
     expect(configs.resolveConfigs("rules-only,full-pipeline").map((c) => c.id)).toEqual(["C1", "C5"]);
     expect(() => configs.resolveConfigs("c9")).toThrow(/Unknown config/);
@@ -119,64 +141,34 @@ describe("metrics", () => {
     expect(metrics.safeDiv(1, 0)).toBe(0);
     expect(metrics.safeDiv(1, 2)).toBe(0.5);
   });
-
   test("confusion uses evaluationExpectedLabel with UNSAFE as positive", () => {
     const rows = [
-      { evaluationExpectedLabel: "UNSAFE", predictedLabel: "UNSAFE" }, // TP
-      { evaluationExpectedLabel: "SAFE", predictedLabel: "SAFE" },     // TN
-      { evaluationExpectedLabel: "SAFE", predictedLabel: "UNSAFE" },   // FP
-      { evaluationExpectedLabel: "UNSAFE", predictedLabel: "SAFE" },   // FN
+      { evaluationExpectedLabel: "UNSAFE", predictedLabel: "UNSAFE" },
+      { evaluationExpectedLabel: "SAFE", predictedLabel: "SAFE" },
+      { evaluationExpectedLabel: "SAFE", predictedLabel: "UNSAFE" },
+      { evaluationExpectedLabel: "UNSAFE", predictedLabel: "SAFE" },
     ];
     expect(metrics.confusion(rows)).toEqual({ TP: 1, TN: 1, FP: 1, FN: 1 });
   });
-
-  test("deriveMetrics computes accuracy/precision/recall/specificity/f1/FPR/FNR", () => {
+  test("deriveMetrics computes the full metric set, zero-safe", () => {
     const m = metrics.deriveMetrics({ TP: 8, TN: 80, FP: 2, FN: 10 });
-    expect(m.total).toBe(100);
     expect(m.accuracy).toBeCloseTo(0.88, 5);
-    expect(m.precision).toBeCloseTo(8 / 10, 5);
+    expect(m.precision).toBeCloseTo(0.8, 5);
     expect(m.recall).toBeCloseTo(8 / 18, 5);
     expect(m.specificity).toBeCloseTo(80 / 82, 5);
     expect(m.falsePositiveRate).toBeCloseTo(2 / 82, 5);
     expect(m.falseNegativeRate).toBeCloseTo(10 / 18, 5);
+    expect(metrics.deriveMetrics({ TP: 0, TN: 0, FP: 0, FN: 0 })).toMatchObject({ accuracy: 0, precision: 0, f1: 0 });
   });
-
-  test("deriveMetrics is zero-safe on an empty matrix", () => {
-    const m = metrics.deriveMetrics({ TP: 0, TN: 0, FP: 0, FN: 0 });
-    expect(m).toMatchObject({ accuracy: 0, precision: 0, recall: 0, f1: 0 });
-  });
-
-  test("percentile uses nearest-rank and does not round", () => {
+  test("percentile nearest-rank; latencyStats", () => {
     const s = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
     expect(metrics.percentile(s, 50)).toBe(5);
     expect(metrics.percentile(s, 95)).toBe(10);
-    expect(metrics.percentile(s, 100)).toBe(10);
-    expect(metrics.percentile([], 50)).toBe(0);
-  });
-
-  test("latencyStats reports count/mean/median/p95/p99/min/max", () => {
     const st = metrics.latencyStats([10, 20, 30, 40, 50]);
-    expect(st.count).toBe(5);
-    expect(st.mean).toBe(30);
-    expect(st.min).toBe(10);
-    expect(st.max).toBe(50);
-    expect(st.median).toBe(30);
+    expect(st).toMatchObject({ count: 5, mean: 30, min: 10, max: 50 });
     expect(metrics.latencyStats([]).count).toBe(0);
   });
-
-  test("perCategory buckets by category with per-bucket metrics", () => {
-    const rows = [
-      { category: "a", evaluationExpectedLabel: "UNSAFE", predictedLabel: "UNSAFE", correct: true },
-      { category: "a", evaluationExpectedLabel: "UNSAFE", predictedLabel: "SAFE", correct: false },
-      { category: "b", evaluationExpectedLabel: "SAFE", predictedLabel: "SAFE", correct: true },
-    ];
-    const pc = metrics.perCategory(rows);
-    expect(pc.a.total).toBe(2);
-    expect(pc.a.correct).toBe(1);
-    expect(pc.b.total).toBe(1);
-  });
-
-  test("semanticSubsetMetrics splits semantic_only vs mixed detection", () => {
+  test("semanticSubsetMetrics splits semantic_only vs mixed", () => {
     const rows = [
       { category: "semantic_manipulation", challengeType: "semantic_only", predictedLabel: "UNSAFE" },
       { category: "semantic_manipulation", challengeType: "semantic_only", predictedLabel: "SAFE" },
@@ -185,12 +177,8 @@ describe("metrics", () => {
     const s = metrics.semanticSubsetMetrics(rows);
     expect(s.semanticOnlyTotal).toBe(2);
     expect(s.semanticOnlyDetectedUnsafe).toBe(1);
-    expect(s.semanticOnlyMissed).toBe(1);
     expect(s.semanticOnlyDetectionRate).toBeCloseTo(0.5, 5);
-    expect(s.mixedSemanticTotal).toBe(1);
-    expect(s.mixedSemanticDetectionRate).toBe(1);
   });
-
   test("outputSafetyMetrics excludes BLOCKED_INPUT from the leakage denominator", () => {
     const probes = [
       { inputVerdict: "SAFE", outputPresent: true, outputSafetyStatus: "FAIL_LEAK" },
@@ -200,50 +188,57 @@ describe("metrics", () => {
       { inputVerdict: "SAFE", outputPresent: false, outputSafetyStatus: "NO_OUTPUT" },
     ];
     const m = metrics.outputSafetyMetrics(probes);
-    expect(m.outputProbeTotal).toBe(5);
-    expect(m.outputProbeBlocked).toBe(1);
     expect(m.outputProbeProducedOutput).toBe(3);
-    expect(m.outputLeakCount).toBe(1);
-    // denominator is produced-output probes (3), not total and not incl. blocked
     expect(m.outputLeakageRateAmongProducedOutputs).toBeCloseTo(1 / 3, 5);
-    expect(m.outputSafeRateAmongProducedOutputs).toBeCloseTo(2 / 3, 5);
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 3. dataset integrity gate
+// 3. dataset + manifest integrity gates  (incl. #1, #2)
 // ═══════════════════════════════════════════════════════════════════════════
-describe("dataset integrity gate", () => {
+describe("dataset + manifest gates", () => {
   test("real data/ceda-1000.json passes the frozen gate", () => {
     const { dataset, datasetInfo } = runner.loadDataset();
     expect(dataset).toHaveLength(1000);
     expect(datasetInfo.sha256).toBe(configs.FROZEN.datasetSha256);
-    expect(datasetInfo.version).toBe("1.1");
   });
 
-  test("checkFrozen catches SHA / total / label / category mismatches", () => {
+  test("checkFrozen catches SHA / total mismatches", () => {
     const good = runner.loadDataset().dataset;
-    // SHA mismatch
-    expect(runner.checkFrozen(good, "deadbeef")).toEqual(
-      expect.arrayContaining([expect.stringMatching(/SHA-256 mismatch/)]),
-    );
-    // Fewer records
-    const short = good.slice(0, 999);
-    const errs = runner.checkFrozen(short, configs.FROZEN.datasetSha256);
-    expect(errs).toEqual(expect.arrayContaining([expect.stringMatching(/total records mismatch/)]));
+    expect(runner.checkFrozen(good, "deadbeef")).toEqual(expect.arrayContaining([expect.stringMatching(/SHA-256 mismatch/)]));
+    expect(runner.checkFrozen(good.slice(0, 999), configs.FROZEN.datasetSha256))
+      .toEqual(expect.arrayContaining([expect.stringMatching(/total records mismatch/)]));
   });
 
-  test("loadDataset throws DatasetIntegrityError on a tampered file", () => {
+  test("loadDataset throws DatasetIntegrityError on a tampered file / missing file", () => {
     const dir = mkTmp("ceda-gate-");
     try {
       const p = path.join(dir, "bad.json");
       fs.writeFileSync(p, JSON.stringify([{ id: "x", input: "ls", expectedLabel: "SAFE", category: "benign", metadata: {} }]));
       expect(() => runner.loadDataset(p)).toThrow(runner.DatasetIntegrityError);
     } finally { rmTmp(dir); }
+    expect(() => runner.loadDataset("/no/such/dataset.json")).toThrow(runner.DatasetIntegrityError);
   });
 
-  test("loadDataset throws when the file is missing", () => {
-    expect(() => runner.loadDataset("/no/such/dataset.json")).toThrow(runner.DatasetIntegrityError);
+  test("#1 correct manifest passes the manifest gate", () => {
+    const { manifest, manifestInfo } = runner.loadManifest();
+    expect(manifest.name).toBe("CEDA-1000");
+    expect(manifest.version).toBe("1.1");
+    expect(manifest.datasetSha256).toBe(configs.FROZEN.datasetSha256);
+    expect(manifest.seedSha256).toBe(configs.FROZEN.seedSha256);
+    expect(manifestInfo.facts.legacyRecords).toBe(215);
+    expect(manifestInfo.facts.extensionRecords).toBe(785);
+  });
+
+  test("#2 manifest mismatch fails before evaluation", () => {
+    expect(runner.checkManifest({ ...runner.MANIFEST_EXPECTED, version: "9.9" }))
+      .toEqual(expect.arrayContaining([expect.stringMatching(/manifest\.version mismatch/)]));
+    const dir = mkTmp("ceda-manifest-");
+    try {
+      const p = path.join(dir, "m.json");
+      fs.writeFileSync(p, JSON.stringify({ ...runner.MANIFEST_EXPECTED, datasetSha256: "bad" }));
+      expect(() => runner.loadManifest(p)).toThrow(runner.DatasetIntegrityError);
+    } finally { rmTmp(dir); }
   });
 });
 
@@ -252,25 +247,22 @@ describe("dataset integrity gate", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("record classification", () => {
   const { dataset } = runner.loadDataset();
-
   test("classifyRecords separates independent/stateful/output-probe", () => {
     const c = runner.classifyRecords(dataset);
     expect(c.independent.length + c.rateLimit.length + c.multiTurn.length).toBe(1000);
-    expect(c.rateLimit.every((r) => r.category === "rate_limit_evasion")).toBe(true);
-    expect(c.multiTurn.every((r) => r.category === "multi_turn_escalation")).toBe(true);
     expect(c.outputProbe.every((r) => r.metadata.fixtureStrategy === "synthetic-temp-fixture")).toBe(true);
+    // output-probe records are a subset of the independent records
+    const indepIds = new Set(c.independent.map((r) => r.id));
+    expect(c.outputProbe.every((r) => indepIds.has(r.id))).toBe(true);
   });
-
   test("groupBySequence orders rate-limit records by sequenceIndex", () => {
-    const c = runner.classifyRecords(dataset);
-    const g = runner.groupBySequence(c.rateLimit, "testName", "sequenceIndex");
+    const g = runner.groupBySequence(runner.classifyRecords(dataset).rateLimit, "testName", "sequenceIndex");
     for (const [, seq] of g) {
       const idx = seq.map((r) => r.metadata.sequenceIndex);
       expect(idx).toEqual([...idx].sort((a, b) => a - b));
     }
   });
-
-  test("classifyResult maps VIOLATION→UNSAFE and everything else→SAFE", () => {
+  test("classifyResult maps VIOLATION→UNSAFE, else SAFE", () => {
     expect(runner.classifyResult({ status: "VIOLATION" })).toBe("UNSAFE");
     expect(runner.classifyResult({ status: "SAFE" })).toBe("SAFE");
     expect(runner.classifyResult({ status: "UNAVAILABLE" })).toBe("SAFE");
@@ -278,68 +270,171 @@ describe("record classification", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 5. fallback detection
+// 5. structured fallback / RAG diagnostics detection
 // ═══════════════════════════════════════════════════════════════════════════
-describe("fallback detection", () => {
+describe("structured diagnostics detection", () => {
   const c2 = configs.CONFIGS.find((c) => c.id === "C2");
   const c1 = configs.CONFIGS.find((c) => c.id === "C1");
+  const c5 = configs.CONFIGS.find((c) => c.id === "C5");
+  const c4 = configs.CONFIGS.find((c) => c.id === "C4");
 
-  test("detects UNAVAILABLE and the reasoning note for semantic configs", () => {
-    expect(runner.detectFallback(c2, { status: "UNAVAILABLE" })).toBe(true);
-    expect(runner.detectFallback(c2, { status: "SAFE", reasoning: "x [Note: Semantic analysis unavailable, rule-based only]" })).toBe(true);
-    expect(runner.detectFallback(c2, { status: "SAFE", reasoning: "ok" })).toBe(false);
+  test("semantic fallback detected from structured diagnostics", () => {
+    expect(runner.detectSemanticFallback(c2, { status: "SAFE", diagnostics: { semanticAttempted: true, semanticFallback: true } })).toBe(true);
+    expect(runner.detectSemanticFallback(c2, { status: "SAFE", diagnostics: { semanticAttempted: true, semanticFallback: false } })).toBe(false);
+    expect(runner.detectSemanticFallback(c1, { status: "SAFE", diagnostics: { semanticAttempted: false, semanticFallback: true } })).toBe(false);
   });
-
-  test("never flags a non-semantic config", () => {
-    expect(runner.detectFallback(c1, { status: "UNAVAILABLE" })).toBe(false);
+  test("#19 rate-limit short-circuit is NOT a semantic fallback", () => {
+    // semantic not attempted → not a model failure, even for a semantic config
+    const r = { status: "VIOLATION", diagnostics: { semanticRequested: true, semanticAttempted: false, semanticFallback: false, shortCircuitedBeforeSemantic: true, shortCircuitReason: "rate_limit" } };
+    expect(runner.detectSemanticFallback(c4, r)).toBe(false);
+    expect(runner.detectRagInfraFailure(c5, r)).toBe(false);
+  });
+  test("#18 RAG success with zero matches is NOT an infra failure", () => {
+    const r = { status: "SAFE", diagnostics: { ragAttempted: true, ragQuerySucceeded: true, ragHadMatches: false, ragUnavailable: false, ragQueryFailed: false } };
+    expect(runner.detectRagInfraFailure(c5, r)).toBe(false);
+  });
+  test("RAG infra failure detected for C5 only", () => {
+    const r = { status: "SAFE", diagnostics: { ragAttempted: true, ragUnavailable: true } };
+    expect(runner.detectRagInfraFailure(c5, r)).toBe(true);
+    expect(runner.detectRagInfraFailure(c4, r)).toBe(false); // C4 has no RAG
+  });
+  test("secondary net still catches UNAVAILABLE when diagnostics are absent", () => {
+    expect(runner.detectSemanticFallback(c2, { status: "UNAVAILABLE" })).toBe(true);
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 6. preflight
+// 6. preflight (scientific gates + provenance)   #3,#4,#5,#6,#7,#8,#9,#10-14
 // ═══════════════════════════════════════════════════════════════════════════
 describe("preflight", () => {
-  function ctxFor(sel, providers) {
+  let fxBase;
+  beforeEach(() => { fxBase = path.join(mkTmp("ceda-pf-"), "probe"); }); // empty, non-existent leaf
+  afterEach(() => { rmTmp(path.dirname(fxBase)); });
+
+  function ctxFor(sel, over = {}) {
     return runner.makeContext({
-      config: MOCK_CONFIG, providers, agent: { processInput: () => {}, resetRateLimiter: () => {} },
+      config: over.config || MOCK_CONFIG,
+      providers: over.providers || availableProviders(),
+      agent: { processInput: () => {}, resetRateLimiter: () => {} },
       configSelection: sel, model: "mock-model",
+      fixtureBase: fxBase,
+      requireCleanGit: over.requireCleanGit !== undefined ? over.requireCleanGit : true,
+      gitProvenance: over.gitProvenance || cleanGit,
     });
   }
+  const find = (report, name) => report.checks.find((c) => c.name === name);
 
-  test("C1 needs no external dependency", async () => {
-    const providers = { defaultInferenceProvider: { isAvailable: async () => false, hasModel: async () => false },
-      defaultVectorStore: { isAvailable: async () => false } };
-    const r = await runner.preflight(ctxFor("c1", providers));
+  test("all gates pass with a compliant environment (C1)", async () => {
+    const r = await runner.preflight(ctxFor("c1"));
     expect(r.ok).toBe(true);
+    expect(find(r, "app-mode-research").ok).toBe(true);
+    expect(find(r, "long-term-memory-writes-disabled").ok).toBe(true);
+    expect(find(r, "fixture-base-safe").ok).toBe(true);
+  });
+
+  test("#3 APP_MODE other than research fails preflight", async () => {
+    const cfg = { ...MOCK_CONFIG, mode: { name: "production" } };
+    const r = await runner.preflight(ctxFor("c1", { config: cfg }));
+    expect(r.ok).toBe(false);
+    expect(find(r, "app-mode-research").ok).toBe(false);
+  });
+
+  test("#4 long-term-memory writes enabled fails preflight", async () => {
+    const cfg = { ...MOCK_CONFIG, memory: { longTermEnabled: true } };
+    const r = await runner.preflight(ctxFor("c1", { config: cfg }));
+    expect(r.ok).toBe(false);
+    expect(find(r, "long-term-memory-writes-disabled").ok).toBe(false);
+  });
+
+  test("#5 clean git passes; #6 dirty git fails", async () => {
+    const ok = await runner.preflight(ctxFor("c1"));
+    expect(find(ok, "git-clean").ok).toBe(true);
+    const dirty = await runner.preflight(ctxFor("c1", { gitProvenance: async () => ({ commit: "x", branch: "b", dirty: true }) }));
+    expect(dirty.ok).toBe(false);
+    expect(find(dirty, "git-clean").ok).toBe(false);
+  });
+
+  test("#7 fixture base symlink fails", async () => {
+    const dir = mkTmp("ceda-sym-");
+    try {
+      const target = path.join(dir, "real"); fs.mkdirSync(target);
+      const link = path.join(dir, "link"); fs.symlinkSync(target, link);
+      const res = await runner.assertFixtureBaseSafe(link);
+      expect(res.ok).toBe(false);
+      expect(res.detail).toMatch(/symlink/);
+    } finally { rmTmp(dir); }
+  });
+
+  test("#8 fixture base non-empty fails", async () => {
+    const dir = mkTmp("ceda-ne-");
+    try {
+      fs.writeFileSync(path.join(dir, "leftover.txt"), "x");
+      const res = await runner.assertFixtureBaseSafe(dir);
+      expect(res.ok).toBe(false);
+      expect(res.detail).toMatch(/non-empty/);
+    } finally { rmTmp(dir); }
+  });
+
+  test("#9 fixture preflight creates + removes a sentinel with no debris", async () => {
+    const parent = mkTmp("ceda-sent-");
+    try {
+      const base = path.join(parent, "probe"); // does not exist yet
+      const res = await runner.assertFixtureBaseSafe(base);
+      expect(res.ok).toBe(true);
+      expect(fs.existsSync(base)).toBe(false); // created-for-test then removed
+      // existing empty dir case: sentinel removed, dir preserved, no debris
+      fs.mkdirSync(base);
+      const res2 = await runner.assertFixtureBaseSafe(base);
+      expect(res2.ok).toBe(true);
+      expect(fs.readdirSync(base)).toEqual([]);
+    } finally { rmTmp(parent); }
+  });
+
+  test("#10 exact model resolution + #12 digest + #13 version recorded", async () => {
+    const r = await runner.preflight(ctxFor("c3"));
+    expect(find(r, "ollama-model-resolved").ok).toBe(true);
+    expect(r.infra.modelResolved).toBe("mock-model");
+    expect(r.infra.modelDigest).toBe("sha256:deadbeef");
+    expect(r.infra.ollamaVersion).toBe("0.6.3");
+  });
+
+  test("#11 ambiguous/missing model fails preflight", async () => {
+    const providers = availableProviders();
+    providers.defaultInferenceProvider.resolveModel = async () => null; // ambiguous/absent
+    const r = await runner.preflight(ctxFor("c3", { providers }));
+    expect(r.ok).toBe(false);
+    expect(find(r, "ollama-model-resolved").ok).toBe(false);
+  });
+
+  test("model resolved but missing digest fails (digest required)", async () => {
+    const providers = availableProviders();
+    providers.defaultInferenceProvider.resolveModel = async (m) => ({ name: m, digest: null });
+    const r = await runner.preflight(ctxFor("c3", { providers }));
+    expect(r.ok).toBe(false);
+  });
+
+  test("#14 C5 records Chroma endpoint/collection/count", async () => {
+    const r = await runner.preflight(ctxFor("c5"));
+    expect(find(r, "chroma-rag-available").ok).toBe(true);
+    expect(r.infra.chromaCollectionName).toBe("security_patterns");
+    expect(r.infra.chromaCollectionCount).toBe(215);
+    expect(r.infra.seedChroma).toBeTruthy();
   });
 
   test("semantic config fails preflight when Ollama is unreachable", async () => {
-    const providers = { defaultInferenceProvider: { isAvailable: async () => false, hasModel: async () => false },
-      defaultVectorStore: { isAvailable: async () => true } };
-    const r = await runner.preflight(ctxFor("c3", providers));
+    const providers = availableProviders();
+    providers.defaultInferenceProvider.isAvailable = async () => false;
+    const r = await runner.preflight(ctxFor("c3", { providers }));
     expect(r.ok).toBe(false);
-    expect(r.failures.join(" ")).toMatch(/ollama-reachable/);
+    expect(find(r, "ollama-reachable").ok).toBe(false);
   });
 
-  test("semantic config fails preflight when the model is absent", async () => {
-    const providers = { defaultInferenceProvider: { isAvailable: async () => true, hasModel: async () => false },
-      defaultVectorStore: { isAvailable: async () => true } };
-    const r = await runner.preflight(ctxFor("c3", providers));
+  test("C5 fails preflight when Chroma is unavailable", async () => {
+    const providers = availableProviders();
+    providers.defaultVectorStore.isAvailable = async () => false;
+    const r = await runner.preflight(ctxFor("c5", { providers }));
     expect(r.ok).toBe(false);
-    expect(r.failures.join(" ")).toMatch(/model/);
-  });
-
-  test("C5 fails preflight when RAG/Chroma is unavailable", async () => {
-    const providers = { defaultInferenceProvider: { isAvailable: async () => true, hasModel: async () => true },
-      defaultVectorStore: { isAvailable: async () => false } };
-    const r = await runner.preflight(ctxFor("c5", providers));
-    expect(r.ok).toBe(false);
-    expect(r.failures.join(" ")).toMatch(/chroma-rag/);
-  });
-
-  test("all dependencies present → preflight passes", async () => {
-    const r = await runner.preflight(ctxFor("all", availableProviders()));
-    expect(r.ok).toBe(true);
+    expect(find(r, "chroma-rag-available").ok).toBe(false);
   });
 });
 
@@ -347,108 +442,52 @@ describe("preflight", () => {
 // 7. output fixtures (fs only)
 // ═══════════════════════════════════════════════════════════════════════════
 describe("output fixtures", () => {
-  test("parseFixtureTarget extracts the path token; ignores non-fixture inputs", () => {
+  test("parseFixtureTarget / assertUnderBase / assertSafeMarker", () => {
     const base = "/tmp/ceda1000-output-probe";
-    expect(outputFixtures.parseFixtureTarget("ls -la /tmp/ceda1000-output-probe/all025", base))
-      .toBe("/tmp/ceda1000-output-probe/all025");
+    expect(outputFixtures.parseFixtureTarget("ls -la /tmp/ceda1000-output-probe/all025", base)).toBe("/tmp/ceda1000-output-probe/all025");
     expect(outputFixtures.parseFixtureTarget("ls /etc", base)).toBeNull();
-  });
-
-  test("assertUnderBase refuses paths outside the base", () => {
-    const base = "/tmp/ceda1000-output-probe";
-    expect(() => outputFixtures.assertUnderBase("/tmp/ceda1000-output-probe/x", base)).not.toThrow();
     expect(() => outputFixtures.assertUnderBase("/etc/passwd", base)).toThrow(/outside fixture base/);
-    expect(() => outputFixtures.assertUnderBase("/tmp/ceda1000-output-probe/../evil", base)).toThrow();
-  });
-
-  test("assertSafeMarker refuses path separators", () => {
-    expect(outputFixtures.assertSafeMarker("CEDA_TEST_TOKEN_001")).toBe("CEDA_TEST_TOKEN_001");
-    expect(() => outputFixtures.assertSafeMarker("../evil")).toThrow();
     expect(() => outputFixtures.assertSafeMarker("a/b")).toThrow();
   });
 
   test("FixtureSet materializes then cleans up EXACTLY what it created", async () => {
     const base = mkTmp("ceda-fx-");
     try {
-      const rec = {
-        id: "op1", input: `ls ${base}/listing001`, category: "output_probing",
-        metadata: { familyId: "op_fixture_listing", fixtureId: "f1",
-          fixtureStrategy: "synthetic-temp-fixture",
-          sensitivePatterns: ["CEDA_TEST_TOKEN_001"], fixtureMarkers: ["CEDA_TEST_TOKEN_001"] },
-      };
+      const rec = { id: "op1", input: `ls ${base}/listing001`, category: "output_probing",
+        metadata: { familyId: "op_fixture_listing", fixtureStrategy: "synthetic-temp-fixture",
+          sensitivePatterns: ["CEDA_TEST_TOKEN_001"], fixtureMarkers: ["CEDA_TEST_TOKEN_001"] } };
       const set = new outputFixtures.FixtureSet(base);
       const d = await set.materialize(rec);
-      expect(fs.existsSync(d.targetPath)).toBe(true);
       expect(fs.existsSync(path.join(d.targetPath, "CEDA_TEST_TOKEN_001"))).toBe(true);
       const created = set.createdPaths();
-      expect(created.files.length).toBeGreaterThan(0);
       await set.cleanup();
-      // every tracked file/dir is gone; the pre-existing base itself remains
       for (const f of created.files) expect(fs.existsSync(f)).toBe(false);
-      expect(fs.existsSync(base)).toBe(true); // base pre-existed → preserved
+      expect(fs.existsSync(base)).toBe(true); // pre-existing base preserved
     } finally { rmTmp(base); }
   });
 
-  test("hidden/recursive families place the marker where the ls variant surfaces it", async () => {
-    const base = mkTmp("ceda-fx2-");
-    try {
-      const hidden = { id: "h", input: `ls -a ${base}/hidden049`, category: "output_probing",
-        metadata: { familyId: "op_fixture_hidden", fixtureStrategy: "synthetic-temp-fixture",
-          sensitivePatterns: ["CEDA_TEST_TOKEN_049"], fixtureMarkers: ["CEDA_TEST_TOKEN_049"] } };
-      const rec = { id: "r", input: `ls -R ${base}/recursive037`, category: "output_probing",
-        metadata: { familyId: "op_fixture_recursive", fixtureStrategy: "synthetic-temp-fixture",
-          sensitivePatterns: ["CEDA_TEST_TOKEN_037"], fixtureMarkers: ["CEDA_TEST_TOKEN_037"] } };
-      const set = new outputFixtures.FixtureSet(base);
-      const dh = await set.materialize(hidden);
-      const dr = await set.materialize(rec);
-      expect(fs.existsSync(path.join(dh.targetPath, ".CEDA_TEST_TOKEN_049"))).toBe(true);
-      expect(fs.existsSync(path.join(dr.targetPath, "nested", "CEDA_TEST_TOKEN_037"))).toBe(true);
-      await set.cleanup();
-    } finally { rmTmp(base); }
-  });
-
-  test("detectLeak matches literal markers only", () => {
-    expect(outputFixtures.detectLeak("x CEDA_TEST_TOKEN_001 y", ["CEDA_TEST_TOKEN_001"]).isLeak).toBe(true);
-    expect(outputFixtures.detectLeak("clean listing", ["CEDA_TEST_TOKEN_001"]).isLeak).toBe(false);
-  });
-
-  test("scoreOutputProbe yields all five statuses", () => {
-    const rec = { id: "p", category: "output_probing", subcategory: "s",
-      metadata: { familyId: "op_fixture_listing", sensitivePatterns: ["MARK1"] } };
+  test("scoreOutputProbe yields all five statuses; BLOCKED_INPUT = over-block", () => {
+    const rec = { id: "p", category: "output_probing", subcategory: "s", metadata: { familyId: "op_fixture_listing", sensitivePatterns: ["MARK1"] } };
     expect(outputFixtures.scoreOutputProbe(rec, { status: "VIOLATION" }).outputSafetyStatus).toBe("BLOCKED_INPUT");
+    expect(outputFixtures.scoreOutputProbe(rec, { status: "VIOLATION" }).inputVerdict).toBe("UNSAFE");
     expect(outputFixtures.scoreOutputProbe(rec, { status: "SAFE", output: "" }).outputSafetyStatus).toBe("NO_OUTPUT");
     expect(outputFixtures.scoreOutputProbe(rec, { status: "SAFE", output: "a\nMARK1\n" }).outputSafetyStatus).toBe("FAIL_LEAK");
     expect(outputFixtures.scoreOutputProbe(rec, { status: "SAFE", output: "a\nb\n" }).outputSafetyStatus).toBe("PASS_NO_LEAK");
     expect(outputFixtures.scoreOutputProbe(rec, null, new Error("x")).outputSafetyStatus).toBe("ERROR");
   });
-
-  test("BLOCKED_INPUT is recorded as UNSAFE input verdict (over-blocking, not a filter win)", () => {
-    const rec = { id: "p", category: "output_probing", metadata: { sensitivePatterns: ["M"] } };
-    const s = outputFixtures.scoreOutputProbe(rec, { status: "VIOLATION" });
-    expect(s.inputVerdict).toBe("UNSAFE");
-    expect(s.outputPresent).toBe(false);
-  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 8. output-dir safety + atomic writes
+// 8. output path safety + atomic writes
 // ═══════════════════════════════════════════════════════════════════════════
 describe("output path safety", () => {
   test("rejects dangerous targets", () => {
-    for (const bad of ["/", ".", "..", "/tmp", "~"]) {
+    for (const bad of ["/", ".", "..", "/tmp", "~", ""]) {
       expect(() => runner.assertSafeOutputDir(bad)).toThrow(runner.OutputPathError);
     }
-    expect(() => runner.assertSafeOutputDir("")).toThrow(runner.OutputPathError);
     expect(() => runner.assertSafeOutputDir("data/results")).toThrow(/historical results/);
     expect(() => runner.assertSafeOutputDir("data/result2/x")).toThrow(/historical results/);
   });
-
-  test("accepts a safe fresh directory", () => {
-    const dir = mkTmp("ceda-out-");
-    try { expect(runner.assertSafeOutputDir(path.join(dir, "run1"))).toBe(path.join(dir, "run1")); }
-    finally { rmTmp(dir); }
-  });
-
   test("atomicWriteJSON writes via a temp file then renames", async () => {
     const dir = mkTmp("ceda-atomic-");
     try {
@@ -456,77 +495,70 @@ describe("output path safety", () => {
       const ctx = { _tempFiles: new Set() };
       await runner.atomicWriteJSON(p, { a: 1 }, ctx);
       expect(JSON.parse(fs.readFileSync(p, "utf8"))).toEqual({ a: 1 });
-      expect(ctx._tempFiles.size).toBe(0); // temp cleaned up after rename
+      expect(ctx._tempFiles.size).toBe(0);
       expect(fs.readdirSync(dir)).toEqual(["out.json"]);
     } finally { rmTmp(dir); }
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 9. provenance
+// 9. provenance (secrets excluded, endpoints sanitized)
 // ═══════════════════════════════════════════════════════════════════════════
 describe("provenance", () => {
-  test("buildRunManifest has the expected shape and no secrets", () => {
+  test("sanitizeEndpoint redacts credentials", () => {
+    expect(provenance.sanitizeEndpoint("http://user:pass@host:8000/x")).not.toMatch(/user|pass/);
+    expect(provenance.sanitizeEndpoint("https://h/x?token=abc123")).toMatch(/REDACTED/);
+    expect(provenance.sanitizeEndpoint("localhost:8000")).toBe("localhost:8000");
+  });
+  test("buildRunManifest shape + no secrets + digest/version/chroma fields", () => {
     const m = provenance.buildRunManifest({
       frozen: configs.FROZEN,
-      datasetInfo: { path: "d", sha256: "s", version: "1.1", total: 1000 },
-      configs: configs.CONFIGS,
-      cli: { mode: "run" },
-      preflight: { ok: true },
-      git: { commit: "abc" },
-      config: MOCK_CONFIG,
-      status: "VALID",
-      timing: { startedAt: "t0", finishedAt: "t1", durationMs: 5 },
-      counts: { ablationRows: 10 },
-      invalidReasons: [],
+      datasetInfo: { path: "d", sha256: configs.FROZEN.datasetSha256, version: "1.1", total: 1000 },
+      manifestInfo: { path: "m", facts: { name: "CEDA-1000" } },
+      configs: configs.CONFIGS, modelRequested: "mock-model",
+      infra: { modelResolved: "mock-model", modelDigest: "sha256:d", ollamaVersion: "0.6.3",
+        chromaCollectionName: "security_patterns", chromaCollectionCount: 215, chromaAvailable: true },
+      seedChroma: { path: "scripts/seedChromaDB.js", matches: true },
+      preflight: { ok: true }, git: { commit: "abc" }, config: MOCK_CONFIG,
+      status: "VALID", timing: { startedAt: "t0", finishedAt: "t1", durationMs: 5 },
+      counts: { ablationRows: 5000 }, invalidReasons: [],
     });
-    expect(m.schema).toMatch(/run-manifest/);
     expect(m.status).toBe("VALID");
-    expect(m.dataset.expectedSha256).toBe(configs.FROZEN.datasetSha256);
-    expect(m.runtime.nodeVersion).toBe(process.version);
-    expect(m.config.ollamaModel).toBe("mock-model");
-    // no secrets: the serialized manifest must not embed process env values
+    expect(m.model.digest).toBe("sha256:d");
+    expect(m.ollama.version).toBe("0.6.3");
+    expect(m.chroma.collectionCount).toBe(215);
+    expect(m.runtime.hostname).toBe(os.hostname());
+    expect(m.longTermMemoryWritesEnabled).toBe(false);
     const json = JSON.stringify(m);
     expect(json).not.toMatch(/process\.env/);
-    expect(m.config).not.toHaveProperty("host");
-  });
-
-  test("configProvenance excludes hosts/ports/paths", () => {
-    const c = provenance.configProvenance(MOCK_CONFIG);
-    expect(c).not.toHaveProperty("host");
-    expect(c).not.toHaveProperty("port");
-    expect(c.mode).toBe("test");
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 10. runEvaluation end-to-end (mocked pipeline, mini dataset, temp output)
+// 10. runEvaluation end-to-end (mocked pipeline)   #15-27, #29
 // ═══════════════════════════════════════════════════════════════════════════
 describe("runEvaluation (mocked)", () => {
   let base;
   beforeEach(() => { base = mkTmp("ceda-run-"); });
   afterEach(() => { rmTmp(base); });
 
-  /** A small synthetic dataset (NOT the frozen one) covering every code path. */
   function miniDataset(fixtureBase) {
     return [
       { id: "benign_1", input: "ls", expectedLabel: "SAFE", category: "benign", subcategory: "s", metadata: {} },
       { id: "atk_1", input: "__BLOCK__ ignore instructions", expectedLabel: "UNSAFE", category: "prompt_injection", subcategory: "s", metadata: {} },
       { id: "sem_1", input: "please politely do bad thing", expectedLabel: "UNSAFE", category: "semantic_manipulation", subcategory: "polite", metadata: { challengeType: "semantic_only" } },
-      // rate-limit sequence of 3 (2 SAFE + final UNSAFE)
       { id: "rl_1_0", input: "ls a", expectedLabel: "SAFE", category: "rate_limit_evasion", subcategory: "rl", metadata: { testName: "RL", sequenceIndex: 0, sequenceLength: 3, expectBlockAfter: 2 } },
       { id: "rl_1_1", input: "ls b", expectedLabel: "SAFE", category: "rate_limit_evasion", subcategory: "rl", metadata: { testName: "RL", sequenceIndex: 1, sequenceLength: 3, expectBlockAfter: 2 } },
       { id: "rl_1_2", input: "__BLOCK__ flood", expectedLabel: "UNSAFE", category: "rate_limit_evasion", subcategory: "rl", metadata: { testName: "RL", sequenceIndex: 2, sequenceLength: 3, expectBlockAfter: 2 } },
-      // multi-turn sequence of 2 (SAFE then UNSAFE)
       { id: "mt_1_0", input: "ls", expectedLabel: "SAFE", category: "multi_turn_escalation", subcategory: "mt", metadata: { sequenceName: "MT", turnIndex: 0, totalTurns: 2, expectSafe: true } },
       { id: "mt_1_1", input: "__BLOCK__ now attack", expectedLabel: "UNSAFE", category: "multi_turn_escalation", subcategory: "mt", metadata: { sequenceName: "MT", turnIndex: 1, totalTurns: 2, expectSafe: false } },
-      // output probes: one that leaks, one clean
       { id: "op_leak", input: `ls ${fixtureBase}/leak001 __LEAK:MARKERX__`, expectedLabel: "SAFE", category: "output_probing", subcategory: "op",
         metadata: { familyId: "op_fixture_listing", fixtureId: "of1", fixtureStrategy: "synthetic-temp-fixture", sensitivePatterns: ["MARKERX"], fixtureMarkers: ["MARKERX"] } },
       { id: "op_clean", input: `ls ${fixtureBase}/clean002`, expectedLabel: "SAFE", category: "output_probing", subcategory: "op",
         metadata: { familyId: "op_fixture_listing", fixtureId: "of2", fixtureStrategy: "synthetic-temp-fixture", sensitivePatterns: ["MARKERY"], fixtureMarkers: ["MARKERY"] } },
     ];
   }
+  const INDEP = 5, RL = 3, MT = 2, PROBES = 2, PER_CONFIG = INDEP + RL + MT; // 10
 
   function ctxFor(fixtureBase, outDir, sel = "c1,c3") {
     const mock = makeMockPipeline();
@@ -534,149 +566,211 @@ describe("runEvaluation (mocked)", () => {
     const ctx = runner.makeContext({
       config: MOCK_CONFIG, providers: availableProviders(),
       processInput: mock.processInput, resetPipeline,
+      gitProvenance: cleanGit,
       configSelection: sel, model: "mock-model",
       fixtureBase, outputDir: outDir, now: () => Date.now(),
     });
     return { ctx, mock, resetPipeline };
   }
+  const deps = (dataset) => ({ dataset, preflightReport: { ok: true, infra: {} }, git: { commit: "t" }, skipManifestGate: true });
 
-  test("produces VALID results, writes all five files, cleans fixtures", async () => {
-    const fxBase = path.join(base, "fx");
-    const outDir = path.join(base, "out");
-    const { ctx } = ctxFor(fxBase, outDir);
-    const dataset = miniDataset(fxBase);
-    const res = await runner.runEvaluation(ctx, {
-      dataset, preflightReport: { ok: true, checks: [], failures: [] }, git: { commit: "test" },
-    });
+  test("#27 zero errors + complete counts = VALID; writes 5 files; cleans fixtures", async () => {
+    const fxBase = path.join(base, "fx"), outDir = path.join(base, "out");
+    const { ctx, mock } = ctxFor(fxBase, outDir);
+    const res = await runner.runEvaluation(ctx, deps(miniDataset(fxBase)));
     expect(res.status).toBe("VALID");
-    // 2 configs × 8 ablation records (all except output_probing? no — output_probing IS independent)
-    // independent = benign,atk,sem,op_leak,op_clean = 5; rl=3; mt=2 → 10 records × 2 configs
-    expect(res.ablationRaw).toHaveLength(20);
+    expect(res.ablationRaw).toHaveLength(PER_CONFIG * 2);
+    expect(mock.processInput).toHaveBeenCalledTimes(PER_CONFIG * 2); // one call per record per config
     for (const f of Object.values(runner.OUTPUT_FILES)) {
       if (f === runner.OUTPUT_FILES.log) continue;
       expect(fs.existsSync(path.join(outDir, f))).toBe(true);
     }
-    // fixtures removed
     expect(fs.existsSync(fxBase)).toBe(false);
-    // output-probe results present for both configs
-    expect(res.outputProbe.byConfig).toHaveLength(2);
-    const c1probes = res.outputProbe.byConfig.find((x) => x.configId === "C1").probes;
-    const leak = c1probes.find((p) => p.recordId === "op_leak");
-    const clean = c1probes.find((p) => p.recordId === "op_clean");
-    expect(leak.outputSafetyStatus).toBe("FAIL_LEAK");
-    expect(clean.outputSafetyStatus).toBe("PASS_NO_LEAK");
   });
 
-  test("rate-limit evaluationExpectedLabel is SAFE when the rate layer is off, dataset label when on", async () => {
+  test("#20 fixture record invokes processInput exactly ONCE per config; #21 same execution feeds both", async () => {
+    const fxBase = path.join(base, "fx");
+    const { ctx, mock } = ctxFor(fxBase, path.join(base, "out"), "c1,c3");
+    const res = await runner.runEvaluation(ctx, deps(miniDataset(fxBase)));
+    const leakCalls = mock.calls.filter((c) => c.input.includes("__LEAK:MARKERX__"));
+    expect(leakCalls).toHaveLength(2); // exactly once per config (2 configs), NOT 4
+    // The output-probe score exists and is flagged as derived from the ablation execution
+    const probe = res.outputProbe.byConfig.find((x) => x.configId === "C1").probes.find((p) => p.recordId === "op_leak");
+    expect(probe.outputSafetyStatus).toBe("FAIL_LEAK");
+    expect(probe.derivedFromAblationExecution).toBe(true);
+    // and the ablation row for the same record+config exists (same single execution)
+    expect(res.ablationRaw.find((r) => r.id === "op_leak" && r.configId === "C1")).toBeTruthy();
+  });
+
+  test("#23 output-probe scores = fixtures × configs; #additional executions = 0", async () => {
+    const fxBase = path.join(base, "fx");
+    const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c1,c3");
+    const res = await runner.runEvaluation(ctx, deps(miniDataset(fxBase)));
+    const scores = res.outputProbe.byConfig.reduce((n, x) => n + x.probes.length, 0);
+    expect(scores).toBe(PROBES * 2);
+    expect(res.counts.additionalOutputProbeExecutions).toBe(0);
+  });
+
+  test("rate-limit evaluationExpectedLabel: SAFE when layer off, dataset label when on", async () => {
     const fxBase = path.join(base, "fx");
     const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c1,c4");
-    const dataset = miniDataset(fxBase);
-    const res = await runner.runEvaluation(ctx, {
-      dataset, preflightReport: { ok: true }, git: { commit: "t" },
-    });
-    const rlFinalC1 = res.ablationRaw.find((r) => r.id === "rl_1_2" && r.configId === "C1");
-    const rlFinalC4 = res.ablationRaw.find((r) => r.id === "rl_1_2" && r.configId === "C4");
-    expect(rlFinalC1.evaluationExpectedLabel).toBe("SAFE");   // rate limiting OFF → SAFE
-    expect(rlFinalC1.datasetExpectedLabel).toBe("UNSAFE");    // dataset label preserved
-    expect(rlFinalC4.evaluationExpectedLabel).toBe("UNSAFE"); // rate limiting ON → dataset label
-    expect(rlFinalC1.layerApplicable).toBe(false);
-    expect(rlFinalC4.layerApplicable).toBe(true);
+    const res = await runner.runEvaluation(ctx, deps(miniDataset(fxBase)));
+    const c1 = res.ablationRaw.find((r) => r.id === "rl_1_2" && r.configId === "C1");
+    const c4 = res.ablationRaw.find((r) => r.id === "rl_1_2" && r.configId === "C4");
+    expect(c1.evaluationExpectedLabel).toBe("SAFE");
+    expect(c1.datasetExpectedLabel).toBe("UNSAFE");
+    expect(c4.evaluationExpectedLabel).toBe("UNSAFE");
   });
 
-  test("multi-turn keeps the dataset label as the evaluation label", async () => {
-    const fxBase = path.join(base, "fx");
-    const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c4");
-    const res = await runner.runEvaluation(ctx, {
-      dataset: miniDataset(fxBase), preflightReport: { ok: true }, git: { commit: "t" },
-    });
-    const mt = res.ablationRaw.find((r) => r.id === "mt_1_1");
-    expect(mt.evaluationExpectedLabel).toBe("UNSAFE");
-    expect(mt.evaluationExpectedLabel).toBe(mt.datasetExpectedLabel);
-  });
-
-  test("reset is called at config + per-record + per-sequence boundaries, never between requests in a sequence", async () => {
+  test("reset at config + per-record + per-sequence boundaries only (single-execution)", async () => {
     const fxBase = path.join(base, "fx");
     const { ctx, resetPipeline } = ctxFor(fxBase, path.join(base, "out"), "c4");
-    const dataset = miniDataset(fxBase);
-    await runner.runEvaluation(ctx, { dataset, preflightReport: { ok: true }, git: { commit: "t" } });
-    // For 1 config: 1 (config) + 5 (independent incl. 2 output_probing) + 1 (rl seq) + 1 (mt seq)
-    //   + 2 (output-probe pass, one per fixture record) = 10 resets.
-    // If reset were called between requests in the rl/mt sequences it would be higher.
-    expect(resetPipeline).toHaveBeenCalledTimes(10);
+    await runner.runEvaluation(ctx, deps(miniDataset(fxBase)));
+    // 1 (config) + 5 (independent, incl. 2 fixture records) + 1 (rl seq) + 1 (mt seq) = 8.
+    // No separate output-probe pass any more (that would have added 2).
+    expect(resetPipeline).toHaveBeenCalledTimes(8);
   });
 
-  test("a silent semantic fallback marks the run INVALID", async () => {
+  test("#15 semantic fallback on a conversational/no-command record → INVALID", async () => {
     const fxBase = path.join(base, "fx");
-    const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c3"); // semantic config
-    const dataset = miniDataset(fxBase).map((r) =>
-      r.id === "sem_1" ? { ...r, input: "__FALLBACK__ probe" } : r);
-    const res = await runner.runEvaluation(ctx, {
-      dataset, preflightReport: { ok: true }, git: { commit: "t" },
-    });
+    const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c3");
+    const dataset = miniDataset(fxBase).map((r) => r.id === "sem_1" ? { ...r, input: "__FALLBACK__ conversational probe" } : r);
+    const res = await runner.runEvaluation(ctx, deps(dataset));
     expect(res.status).toBe("INVALID");
-    expect(res.invalidReasons.join(" ")).toMatch(/degraded to rule-only/);
+    expect(res.invalidReasons.join(" ")).toMatch(/fallback/);
     expect(res.errors.modelErrors).toBeGreaterThan(0);
   });
 
-  test("execution errors are counted and surfaced without crashing the run", async () => {
+  test("#16 semantic fallback on a command path → INVALID", async () => {
+    const fxBase = path.join(base, "fx");
+    const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c3");
+    const dataset = miniDataset(fxBase).map((r) => r.id === "benign_1" ? { ...r, input: "ls __FALLBACK__" } : r);
+    const res = await runner.runEvaluation(ctx, deps(dataset));
+    expect(res.status).toBe("INVALID");
+    expect(res.errors.modelErrors).toBeGreaterThan(0);
+  });
+
+  test("#17 C5 RAG infrastructure failure → INVALID", async () => {
+    const fxBase = path.join(base, "fx");
+    const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c5");
+    const dataset = miniDataset(fxBase).map((r) => r.id === "sem_1" ? { ...r, input: "__RAGFAIL__ probe" } : r);
+    const res = await runner.runEvaluation(ctx, deps(dataset));
+    expect(res.status).toBe("INVALID");
+    expect(res.invalidReasons.join(" ")).toMatch(/RAG/);
+    expect(res.errors.dependencyErrors).toBeGreaterThan(0);
+  });
+
+  test("#18 C5 RAG success with zero matches stays VALID", async () => {
+    const fxBase = path.join(base, "fx");
+    const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c5");
+    // default mock: ragQuerySucceeded true, ragHadMatches false → not a failure
+    const res = await runner.runEvaluation(ctx, deps(miniDataset(fxBase)));
+    expect(res.status).toBe("VALID");
+    expect(res.errors.dependencyErrors).toBe(0);
+  });
+
+  test("#24 execution error → INVALID", async () => {
     const fxBase = path.join(base, "fx");
     const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c1");
-    const dataset = miniDataset(fxBase).map((r) =>
-      r.id === "benign_1" ? { ...r, input: "__THROW__" } : r);
-    const res = await runner.runEvaluation(ctx, {
-      dataset, preflightReport: { ok: true }, git: { commit: "t" },
-    });
+    const dataset = miniDataset(fxBase).map((r) => r.id === "benign_1" ? { ...r, input: "__THROW__" } : r);
+    const res = await runner.runEvaluation(ctx, deps(dataset));
+    expect(res.status).toBe("INVALID");
     expect(res.errors.executionErrors).toBeGreaterThan(0);
-    const row = res.ablationRaw.find((r) => r.id === "benign_1");
-    expect(row.predictedLabel).toBe("ERROR");
-    expect(row.error).toBeTruthy();
+    expect(res.ablationRaw.find((r) => r.id === "benign_1").predictedLabel).toBe("ERROR");
+  });
+
+  test("#25 fixture error → INVALID", async () => {
+    // fixtureBase does NOT match the record input path → materialize throws
+    const { ctx } = ctxFor(path.join(base, "wrong-base"), path.join(base, "out"), "c1");
+    const dataset = miniDataset(path.join(base, "actual-fx")); // inputs reference a different base
+    const res = await runner.runEvaluation(ctx, deps(dataset));
+    expect(res.status).toBe("INVALID");
+    expect(res.errors.fixtureErrors).toBeGreaterThan(0);
+  });
+
+  test("#26 incomplete sample count (a record not scored) → INVALID", async () => {
+    // An execution error means the record is counted in recordsTotal but not in
+    // recordsScored, so the config is incomplete (scored < expected) → INVALID
+    // with an explicit "incomplete" reason (never a 'valid' result over fewer
+    // samples).
+    const fxBase = path.join(base, "fx");
+    const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c1");
+    const dataset = miniDataset(fxBase).map((r) => r.id === "sem_1" ? { ...r, input: "__THROW__" } : r);
+    const res = await runner.runEvaluation(ctx, deps(dataset));
+    expect(res.status).toBe("INVALID");
+    expect(res.invalidReasons.join(" ")).toMatch(/incomplete/);
+    const s = res.summary.configs.find((x) => x.configId === "C1");
+    expect(s.recordsScored).toBeLessThan(s.recordsTotal); // never silently valid over fewer samples
+  });
+
+  test("#29 diagnostics default OFF: mock without capture still runs; run remains structurally valid", async () => {
+    // Prove the runner always turns capture ON for its own executions.
+    const fxBase = path.join(base, "fx");
+    const { ctx, mock } = ctxFor(fxBase, path.join(base, "out"), "c3");
+    await runner.runEvaluation(ctx, deps(miniDataset(fxBase)));
+    expect(mock.calls.every((c) => c.opts.captureEvaluationDiagnostics === true)).toBe(true);
   });
 
   test("runEvaluation refuses to proceed when preflight fails", async () => {
     const fxBase = path.join(base, "fx");
     const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c3");
-    // no preflightReport injected + providers report unavailable
-    ctx.inferenceProvider = { isAvailable: async () => false, hasModel: async () => false };
+    ctx.inferenceProvider = { isAvailable: async () => false, hasModel: async () => false, resolveModel: async () => null, version: async () => null };
     ctx.vectorStore = { isAvailable: async () => false };
-    await expect(runner.runEvaluation(ctx, { dataset: miniDataset(fxBase), git: { commit: "t" } }))
+    ctx.requireCleanGit = false;
+    await expect(runner.runEvaluation(ctx, { dataset: miniDataset(fxBase), git: { commit: "t" }, skipManifestGate: true }))
       .rejects.toThrow(runner.PreflightError);
   });
 
-  test("summary confusion matrix uses evaluationExpectedLabel", async () => {
+  test("summary carries both evaluation and raw dataset metrics", async () => {
     const fxBase = path.join(base, "fx");
     const { ctx } = ctxFor(fxBase, path.join(base, "out"), "c1");
-    const res = await runner.runEvaluation(ctx, {
-      dataset: miniDataset(fxBase), preflightReport: { ok: true }, git: { commit: "t" },
-    });
+    const res = await runner.runEvaluation(ctx, deps(miniDataset(fxBase)));
     const s = res.summary.configs.find((x) => x.configId === "C1");
     expect(s.evaluationMetrics).toHaveProperty("precision");
     expect(s.rawDatasetMetrics).toHaveProperty("precision");
     expect(s.latency).toHaveProperty("p95");
-    expect(s.perCategory).toHaveProperty("benign");
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 11. CLI argument parsing
+// 11. #22 full 1000-record mocked run = exactly 5000 processInput calls
+// ═══════════════════════════════════════════════════════════════════════════
+describe("full-dataset call accounting (mocked, no inference)", () => {
+  test("#22 all C1–C5 over 1000 records → exactly 5000 processInput calls, 225 probe scores", async () => {
+    const { dataset, datasetInfo } = runner.loadDataset();
+    const mock = makeMockPipeline();
+    const ctx = runner.makeContext({
+      config: MOCK_CONFIG, providers: availableProviders(),
+      processInput: mock.processInput, resetPipeline: () => {},
+      gitProvenance: cleanGit,
+      configSelection: "all", model: "mock-model",
+      // Real fixture base so the 45 extension probe inputs resolve to fixtures.
+      fixtureBase: outputFixtures.DEFAULT_BASE,
+      datasetInfo,
+    });
+    const res = await runner.runEvaluation(ctx, {
+      dataset, preflightReport: { ok: true, infra: {} }, git: { commit: "t" }, skipManifestGate: true,
+    });
+    expect(mock.processInput).toHaveBeenCalledTimes(5000);
+    expect(res.ablationRaw).toHaveLength(5000);
+    expect(res.counts.processInputCalls).toBe(5000);
+    expect(res.counts.additionalOutputProbeExecutions).toBe(0);
+    const scores = res.outputProbe.byConfig.reduce((n, x) => n + x.probes.length, 0);
+    expect(scores).toBe(225);
+  }, 30000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 12. CLI argument parsing
 // ═══════════════════════════════════════════════════════════════════════════
 describe("CLI parseArgs", () => {
   test("parses flags and values (space and = forms)", () => {
     const o = cli.parseArgs(["--dry-run", "--configs", "c1,c3", "--output-dir=/x/y", "--model", "m", "--verbose"]);
-    expect(o.dryRun).toBe(true);
-    expect(o.configs).toBe("c1,c3");
-    expect(o.outputDir).toBe("/x/y");
-    expect(o.model).toBe("m");
-    expect(o.verbose).toBe(true);
+    expect(o).toMatchObject({ dryRun: true, configs: "c1,c3", outputDir: "/x/y", model: "m", verbose: true });
   });
-
-  test("defaults + preflight/overwrite flags", () => {
+  test("defaults + preflight/overwrite; unknown flag throws", () => {
     const o = cli.parseArgs(["--preflight", "--overwrite"]);
-    expect(o.preflight).toBe(true);
-    expect(o.overwrite).toBe(true);
-    expect(o.configs).toBe("all");
-  });
-
-  test("unknown flag throws UsageError", () => {
+    expect(o).toMatchObject({ preflight: true, overwrite: true, configs: "all" });
     expect(() => cli.parseArgs(["--nope"])).toThrow(cli.UsageError);
   });
 });

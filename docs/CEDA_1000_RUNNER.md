@@ -121,7 +121,7 @@ npm run eval:ceda1000 -- [options]
 | --- | --- |
 | `--help` | Usage and exit. |
 | `--dry-run` | Gate the dataset, print the execution plan, write nothing. |
-| `--preflight` | Check required dependencies (no model inference), then exit. |
+| `--preflight` | Check all scientific preconditions + dependencies (APP_MODE, LTM writes disabled, clean git, fixture-base safety, exact model+digest, Ollama version, Chroma collection) — no model inference — then exit. |
 | `--configs <sel>` | `all` (default) or a comma list of ids/names (`c1,c3` or `rules-only,full-pipeline`). |
 | `--output-dir <dir>` | **Required** for a real run. Must not be `data/results`, `data/result2`, the repo/filesystem/temp root, `.`, `..`, or `/`. |
 | `--model <name>` | Ollama model for semantic configs (**per-process override**, no global config mutation). Default: research-core config. |
@@ -145,7 +145,7 @@ trigger fixture and temp-file cleanup.
 
 | File | Contents |
 | --- | --- |
-| `run-manifest.json` | Provenance: dataset SHA, configs, CLI, preflight, git, runtime, config snapshot, status, timing. Timestamps are included (this is run output, not dataset generation). No secrets. |
+| `run-manifest.json` | Full provenance: dataset + manifest facts/SHA, configs, requested/resolved model + **digest**, Ollama host (credential-sanitized) + version, Chroma host/collection/count, long-term-memory-writes flag, `seedChromaDB.js` SHA, APP_MODE, git commit/branch/dirty, Node/platform/arch/OS/hostname, CLI, preflight report, counts, status, timing. Timestamps included (run output, not dataset generation). No secrets; endpoint credentials are redacted. |
 | `ablation-raw.json` | One row per record × config (up to 5000). |
 | `ablation-summary.json` | Aggregate metrics per config. |
 | `output-probe-results.json` | Output-safety probe results + metrics, per config. |
@@ -166,6 +166,96 @@ npm run eval:ceda1000 -- \
   --verbose
 ```
 
-Preflight failing simply means a required service is down — bring it up and retry.
-An `INVALID` result means a semantic layer degraded mid-run; the results should be
-discarded and the run repeated once the model is stable.
+Preflight failing simply means a required service is down (or the environment is
+not configured for a scientific run) — fix it and retry. An `INVALID` result means
+scientific integrity was violated mid-run; the results must be discarded and the
+run repeated once the cause is fixed.
+
+## Final Scientific Validity Contract
+
+Before the real GPU experiment, the runner enforces a strict validity contract.
+A run is **VALID** (and its numbers usable) only when **every** condition below
+holds. Any violation yields **INVALID** (diagnostic artifacts are still written,
+clearly marked). A structural inability to run (crash, cannot load dataset,
+cannot write output) is **FAILED**.
+
+### Mandatory environment (checked at preflight; a real run aborts if any fail)
+
+- **`APP_MODE=research`** — the run must use research mode
+  (`config.mode.name === "research"`). `production` and `test` are rejected.
+  Preflight prints `app-mode-research: PASS/FAIL`.
+- **`LONG_TERM_MEMORY_ENABLED=false`** — runtime long-term-memory writes must be
+  disabled (`config.memory.longTermEnabled === false`). Otherwise C4 would write
+  newly-blocked attack patterns into Chroma via
+  `longTermMemory.storeBlockedPattern`, and C5 (which runs later) would inherit
+  C4-produced data — cross-configuration contamination. The runner **never**
+  changes this value itself and **never** mutates `process.env`; the environment
+  must provide it. Preflight prints `long-term-memory-writes-disabled: PASS/FAIL`.
+  This disables **only** runtime learning/writing — **session memory** (C4) and
+  **C5 RAG reads** are unaffected.
+- **Clean git working tree** — a scientific run must not run against uncommitted
+  source. Preflight records commit, branch and dirty status and fails if dirty.
+- **Dataset + manifest hard gate** — the SHA-256 of `data/ceda-1000.json` must
+  equal the frozen v1.1 SHA, and `data/ceda-1000.manifest.json` must assert the
+  exact expected facts (name, version, totals, `legacyRecords=215`,
+  `extensionRecords=785`, seed SHA, dataset SHA, `supersedesVersion`,
+  `supersedesDatasetSha256`). The manifest's `datasetSha256` is cross-checked
+  against the actual dataset file. Any disagreement aborts before evaluation.
+- **Exact Ollama model + digest** — for semantic configs the requested model must
+  resolve to exactly one installed model (no prefix/ambiguous matching) and its
+  **digest** is required and recorded. Preflight also records the Ollama server
+  **version** (non-inference `/api/version`). Preflight never triggers inference.
+- **Controlled Chroma for C5** — the runner **never** starts, seeds, resets or
+  destroys Chroma. C5 requires a pre-seeded, controlled collection; preflight
+  records its endpoint, collection name and count and fails if the collection is
+  unavailable or empty. The SHA-256 of `scripts/seedChromaDB.js` is captured as
+  code provenance (verified against the previously-validated value; a mismatch is
+  reported, never silently claimed).
+- **Fixture base is really safe** — preflight actually verifies
+  `/tmp/ceda1000-output-probe`: it must not be a symlink, must be a directory (or
+  absent), must be empty, and must be writable (proven with a sentinel that is
+  created and removed, leaving no debris). The temp root is never removed and
+  pre-existing content is never overwritten. Safety is re-checked at run start.
+
+### Mandatory run integrity (enforced from structured diagnostics)
+
+- **No semantic fallback.** Semantic configs (C2–C5) require a real model. The
+  pipeline exposes evaluation-only, decision-neutral diagnostics
+  (`semanticRequested/Attempted/Fallback/Succeeded`, `shortCircuitedBeforeSemantic`,
+  `shortCircuitReason`, and RAG status). If a semantic layer degrades to rule-only
+  **on any path** — including conversational/no-command SAFE inputs where no
+  reasoning note exists — the run is **INVALID**. Detection is structural, not
+  reasoning-string parsing. A **rate-limit short-circuit before semantic**
+  (`semanticAttempted=false`, `shortCircuitReason="rate_limit"`) is **not** a
+  model failure and does not invalidate.
+- **No C5 RAG infrastructure failure.** A RAG query that **succeeds with zero
+  matches is VALID**; a query that is **unavailable or fails** is INVALID for C5.
+- **Zero errors.** `totalErrors` (model, dependency, execution, fixture, unknown)
+  must be `0`.
+- **Complete sample counts.** Every record is executed and scored for every
+  config: for the full dataset, `recordsScored === recordsTotal === 1000` per
+  config and `ablation-raw.json` has exactly `5000` rows for C1–C5. A record error
+  is never silently excluded to compute a "valid" result over fewer samples.
+
+### Single execution of every record
+
+Each dataset record calls `processInput()` **exactly once per configuration**.
+For a synthetic output-probe fixture record, the output-safety leakage score is
+derived from **that same** pipeline result — there is **no** second execution. So
+for all five configs over 1000 records:
+
+- `plannedProcessInputCalls` = **5000** (actual pipeline calls = 5000)
+- `plannedOutputProbeScores` = **225** (45 fixtures × 5 configs)
+- `plannedAdditionalOutputProbeExecutions` = **0**
+
+`--dry-run` reports these counts and performs **zero** pipeline / Ollama / Chroma
+calls and creates **zero** fixtures.
+
+### Evaluation diagnostics are opt-in and decision-neutral
+
+The `captureEvaluationDiagnostics` option added to `processInput()` is **default
+OFF**. When off, the result contract is identical to the historical pipeline (no
+`diagnostics` field) and no SAFE/UNSAFE decision, prompt, threshold, or execution
+changes. The runner turns it **on** for its own executions to obtain the
+structured facts above. It exposes only facts the pipeline already computes — never
+hidden model chain-of-thought or hidden prompts.

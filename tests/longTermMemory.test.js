@@ -4,14 +4,35 @@ jest.mock("../packages/research-core/src/rag/chromaClient", () => ({
 }));
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { getCollection } = require("../packages/research-core/src/rag/chromaClient");
+const config = require("../packages/research-core/src/utils/config");
 const {
   storeBlockedPattern,
   loadRecentViolations,
 } = require("../packages/research-core/src/memory/longTermMemory");
 
+// Test isolation: loadRecentViolations reads config.logging.file, and other
+// suites' logSecurity() appends to that same file. Sharing the repository's real
+// logs/security.log across parallel Jest workers races the writeFileSync/read in
+// these tests (observed as attack-17 vs attack-18). Point the log at a unique
+// per-suite temp file for the duration of this suite, then restore + clean up.
+let tmpLogDir;
+let originalLogFile;
+
 describe("longTermMemory", () => {
+  beforeAll(() => {
+    originalLogFile = config.logging.file;
+    tmpLogDir = fs.mkdtempSync(path.join(os.tmpdir(), "ltm-test-"));
+    config.logging.file = path.join(tmpLogDir, "security.log");
+  });
+
+  afterAll(() => {
+    config.logging.file = originalLogFile;
+    try { fs.rmSync(tmpLogDir, { recursive: true, force: true }); } catch (_) {}
+  });
+
   beforeEach(() => {
     jest.clearAllMocks();
   });
@@ -64,13 +85,13 @@ describe("longTermMemory", () => {
   });
 
   describe("loadRecentViolations", () => {
-    const testLogDir = path.join(__dirname, "..", "logs");
-    const testLogFile = path.join(testLogDir, "security.log");
+    // Isolated temp log file (set in the suite-level beforeAll); never the
+    // repository's real logs/security.log.
+    let testLogFile;
 
     beforeEach(() => {
-      if (!fs.existsSync(testLogDir)) {
-        fs.mkdirSync(testLogDir, { recursive: true });
-      }
+      testLogFile = config.logging.file;
+      fs.mkdirSync(path.dirname(testLogFile), { recursive: true });
     });
 
     test("reads violation entries from log file", () => {

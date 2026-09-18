@@ -2,27 +2,32 @@
  * CEDA-1000 evaluation runner (core logic).
  *
  * Responsibilities:
- *   - Load data/ceda-1000.json and HARD-GATE it against the frozen v1.1 facts
- *     (exact SHA-256, version, totals, per-category counts). Any mismatch aborts
- *     the run — there is no warn-and-continue path.
+ *   - Load data/ceda-1000.json AND data/ceda-1000.manifest.json and HARD-GATE
+ *     both against the frozen v1.1 facts (exact SHA-256, version, totals,
+ *     per-category counts, manifest cross-checks). Any mismatch aborts the run —
+ *     there is no warn-and-continue path.
  *   - Preserve the historical C1–C5 ablation semantics (see runAblation.js):
  *     reset before each independent record and before each stateful sequence,
  *     never between requests/turns within a sequence; rate-limit records are
  *     evaluated as SAFE when the rate-limit layer is disabled.
- *   - Execute independent, rate-limit (stateful) and multi-turn (stateful)
- *     records; separately score output-safety probes against synthetic fixtures.
+ *   - Execute EVERY dataset record EXACTLY ONCE per configuration. Output-safety
+ *     probes are scored from that SAME single pipeline execution — never a
+ *     second call.
  *   - NEVER silently fall back: semantic configs (C2–C5) require a real model and
  *     C5 requires RAG. Preflight refuses to run when a required dependency is
- *     unavailable, and any per-record fallback observed during a run marks the
- *     run INVALID.
+ *     unavailable; a semantic fallback or a RAG infrastructure failure OBSERVED
+ *     mid-run (via structured pipeline diagnostics) marks the run INVALID.
+ *   - Enforce the scientific-validity contract: research mode, long-term-memory
+ *     writes disabled, clean git, exact model+digest, zero errors, complete
+ *     sample counts.
  *   - Emit raw results, aggregate metrics, output-probe results, sequence
- *     results and a provenance manifest — written atomically.
+ *     results and a full provenance manifest — written atomically.
  *   - NEVER modify the dataset. Dataset input strings flow ONLY into
  *     processInput() (and, as pure strings, into fixture-path parsing).
  *
  * This module is dependency-injectable: processInput, resetPipeline, the
- * inference/vector providers, and config are all overridable so the unit suite
- * runs with mocks and never touches Ollama, Chroma or a GPU.
+ * inference/vector providers, git provenance, and config are all overridable so
+ * the unit suite runs with mocks and never touches Ollama, Chroma or a GPU.
  */
 
 const fs = require("fs");
@@ -38,6 +43,26 @@ const provenance = require("./provenance");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const DEFAULT_DATASET = path.join(REPO_ROOT, "data", "ceda-1000.json");
+const DEFAULT_MANIFEST = path.join(REPO_ROOT, "data", "ceda-1000.manifest.json");
+
+// Previously-validated SHA of the Chroma seed script (code provenance for C5).
+const SEED_CHROMA_EXPECTED_SHA =
+  "91454bec3d34e8ff0873023f65e11a8d20f0c081e96fbc914cf892dd70c036ca";
+
+// Exact facts the dataset manifest MUST assert (anchored to the frozen dataset).
+const MANIFEST_EXPECTED = Object.freeze({
+  name: "CEDA-1000",
+  version: "1.1",
+  totalRecords: 1000,
+  safe: 500,
+  unsafe: 500,
+  legacyRecords: 215,
+  extensionRecords: 785,
+  seedSha256: FROZEN.seedSha256,
+  datasetSha256: FROZEN.datasetSha256,
+  supersedesVersion: "1.0",
+  supersedesDatasetSha256: "5048d9672bfef2f2c20b320417c3c241266faabc6f1039fafa35506b20fd75bc",
+});
 
 // Output directories the runner must NEVER write into (historical results).
 const FORBIDDEN_OUTPUT_DIRS = [
@@ -64,7 +89,7 @@ class OutputPathError extends Error {
   constructor(message) { super(message); this.name = "OutputPathError"; }
 }
 
-// ─── Dataset load + integrity gate ───────────────────────────────────────────
+// ─── Dataset + manifest integrity gates ──────────────────────────────────────
 
 function sha256Hex(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
@@ -109,6 +134,21 @@ function checkFrozen(dataset, sha256, frozen = FROZEN) {
   return errors;
 }
 
+/** Collect every reason the manifest diverges from the expected facts. */
+function checkManifest(manifest, expected = MANIFEST_EXPECTED) {
+  const errors = [];
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    errors.push("manifest is not an object");
+    return errors;
+  }
+  for (const k of Object.keys(expected)) {
+    if (manifest[k] !== expected[k]) {
+      errors.push(`manifest.${k} mismatch: expected ${JSON.stringify(expected[k])}, got ${JSON.stringify(manifest[k])}`);
+    }
+  }
+  return errors;
+}
+
 /**
  * Load the dataset and HARD-GATE it. Throws DatasetIntegrityError on any
  * divergence. Never mutates the file.
@@ -143,6 +183,44 @@ function loadDataset(datasetPath = DEFAULT_DATASET, deps = {}) {
   };
 }
 
+/**
+ * Load the dataset manifest and HARD-GATE it. Throws DatasetIntegrityError on
+ * any divergence. Never mutates the file.
+ */
+function loadManifest(manifestPath = DEFAULT_MANIFEST, deps = {}) {
+  const fsi = deps.fs || fs;
+  if (!fsi.existsSync(manifestPath)) {
+    throw new DatasetIntegrityError(`dataset manifest not found at ${manifestPath}`, { manifestPath });
+  }
+  let manifest;
+  try { manifest = JSON.parse(fsi.readFileSync(manifestPath, "utf8")); }
+  catch (e) { throw new DatasetIntegrityError(`manifest is not valid JSON: ${e.message}`, { manifestPath }); }
+
+  const errors = checkManifest(manifest, deps.expected || MANIFEST_EXPECTED);
+  if (errors.length > 0) {
+    throw new DatasetIntegrityError(
+      `manifest integrity gate FAILED (${errors.length} problem(s)); refusing to run:\n  - ` +
+        errors.join("\n  - "),
+      { manifestPath, errors },
+    );
+  }
+  return { manifest, manifestInfo: { path: manifestPath, facts: manifest } };
+}
+
+/** Code-provenance for the Chroma seed script (verify, never assume). */
+function seedChromaProvenance() {
+  const abs = path.join(REPO_ROOT, "scripts", "seedChromaDB.js");
+  if (!fs.existsSync(abs)) {
+    return { path: "scripts/seedChromaDB.js", present: false, sha256: null,
+      expectedSha256: SEED_CHROMA_EXPECTED_SHA, matches: false };
+  }
+  const sha = sha256Hex(fs.readFileSync(abs));
+  return {
+    path: "scripts/seedChromaDB.js", present: true, sha256: sha,
+    expectedSha256: SEED_CHROMA_EXPECTED_SHA, matches: sha === SEED_CHROMA_EXPECTED_SHA,
+  };
+}
+
 // ─── Record classification (independent vs stateful vs output-probe) ──────────
 
 function isStatefulEntry(entry) {
@@ -153,7 +231,9 @@ function classifyRecords(dataset) {
   const independent = dataset.filter((e) => !isStatefulEntry(e));
   const rateLimit = dataset.filter((e) => e.category === "rate_limit_evasion");
   const multiTurn = dataset.filter((e) => e.category === "multi_turn_escalation");
-  // Output-safety probing runs against records that declare a synthetic fixture.
+  // Output-safety probing scores records that declare a synthetic fixture. These
+  // are a SUBSET of the independent records — they are executed once (in the
+  // independent pass) and scored from that same execution.
   const outputProbe = dataset.filter((e) => outputFixtures.isFixtureRecord(e));
   return { independent, rateLimit, multiTurn, outputProbe };
 }
@@ -173,81 +253,201 @@ function groupBySequence(entries, keyField, orderField) {
   return groups;
 }
 
-// ─── Classification + fallback detection ─────────────────────────────────────
+// ─── Classification + structured validity detection ──────────────────────────
 
 /** Same mapping as the historical runner: VIOLATION → UNSAFE, else SAFE. */
 function classifyResult(pipelineResult) {
   return pipelineResult && pipelineResult.status === "VIOLATION" ? "UNSAFE" : "SAFE";
 }
 
+function extractDiagnostics(result) {
+  return (result && result.diagnostics) || null;
+}
+
 /**
- * Best-effort per-record detection that the semantic layer silently degraded to
- * rule-only. Primary protection is preflight; this is defense-in-depth so a
- * mid-run outage still invalidates results rather than corrupting them.
+ * Structured semantic-fallback detection. Uses the pipeline's evaluation-only
+ * diagnostics (semanticAttempted && semanticFallback) — reliable on EVERY path
+ * including conversational/no-command SAFE results where no reasoning note
+ * exists. Falls back to legacy signals only if diagnostics are absent.
  */
-function detectFallback(config, pipelineResult) {
-  if (!config.requiresSemantic || !pipelineResult) return false;
-  if (pipelineResult.status === "UNAVAILABLE") return true;
-  const reasoning = pipelineResult.reasoning || "";
-  if (typeof reasoning === "string" && reasoning.includes("Semantic analysis unavailable")) return true;
-  return false;
+function detectSemanticFallback(config, result) {
+  if (!config.requiresSemantic || !result) return false;
+  const d = extractDiagnostics(result);
+  if (d) return d.semanticAttempted === true && d.semanticFallback === true;
+  // Secondary net (diagnostics not captured): status/reasoning heuristics.
+  if (result.status === "UNAVAILABLE") return true;
+  const reasoning = result.reasoning || "";
+  return typeof reasoning === "string" && reasoning.includes("Semantic analysis unavailable");
+}
+
+/**
+ * Structured RAG-infrastructure-failure detection for C5. A query that succeeds
+ * with zero matches is VALID; only an unavailable/failed vector-store query is a
+ * scientific-validity failure.
+ */
+function detectRagInfraFailure(config, result) {
+  if (!config.requiresRAG || !result) return false;
+  const d = extractDiagnostics(result);
+  if (!d) return false;
+  return d.ragAttempted === true && (d.ragUnavailable === true || d.ragQueryFailed === true);
+}
+
+// Backwards-compatible alias (older name).
+const detectFallback = detectSemanticFallback;
+
+// ─── Fixture-base safety (real filesystem verification) ───────────────────────
+
+/**
+ * Really verify the synthetic-fixture base is safe to use: not a symlink, a
+ * directory (or absent), empty, and actually writable — proven with a sentinel
+ * that is removed afterward, leaving no debris. Never removes pre-existing
+ * content and never touches the temp root itself.
+ */
+async function assertFixtureBaseSafe(base) {
+  const abs = path.resolve(base);
+  if (abs === "/" || abs === path.parse(abs).root || abs === path.resolve(os.tmpdir())) {
+    return { ok: false, detail: `unsafe fixture base: ${abs}` };
+  }
+  let existed = false;
+  try {
+    const st = await fsp.lstat(abs);
+    existed = true;
+    if (st.isSymbolicLink()) return { ok: false, detail: `fixture base is a symlink: ${abs}` };
+    if (!st.isDirectory()) return { ok: false, detail: `fixture base exists but is not a directory: ${abs}` };
+    const entries = await fsp.readdir(abs);
+    if (entries.length > 0) {
+      return { ok: false, detail: `fixture base is non-empty (data from another run?): ${abs} (${entries.length} entr${entries.length === 1 ? "y" : "ies"})` };
+    }
+  } catch (e) {
+    if (e.code !== "ENOENT") return { ok: false, detail: `cannot stat fixture base: ${e.message}` };
+    existed = false;
+  }
+  try {
+    if (!existed) await fsp.mkdir(abs, { recursive: true });
+    const sentinel = path.join(abs, ".ceda1000-preflight-sentinel");
+    await fsp.writeFile(sentinel, "ok", { encoding: "utf8", mode: 0o600 });
+    await fsp.rm(sentinel, { force: true });
+    if (!existed) await fsp.rmdir(abs); // remove ONLY the dir we created
+  } catch (e) {
+    return { ok: false, detail: `fixture base not writable: ${e.message}` };
+  }
+  return { ok: true, detail: `safe, empty, writable: ${abs}` };
 }
 
 // ─── Preflight ───────────────────────────────────────────────────────────────
 
 /**
- * Check that every dependency the selected configs REQUIRE is actually
- * available. Returns a structured report; ok=false means the run must not
- * proceed. This is NOT a code failure — services simply being down is a normal,
- * reportable outcome.
+ * Verify every scientific precondition and dependency. Returns a structured
+ * report; ok=false means the run must not proceed. Services being down (or the
+ * environment not being configured for a real run) is a normal, reportable
+ * outcome — NOT a code failure. report.infra collects provenance facts gathered
+ * here (model digest, ollama version, chroma collection) with no inference.
  */
 async function preflight(ctx) {
   const configs = ctx.configs;
   const model = ctx.model;
-  const report = { ok: true, model, checks: [], failures: [] };
-
-  const needSemantic = configs.some((c) => c.requiresSemantic);
-  const needRAG = configs.some((c) => c.requiresRAG);
+  const report = { ok: true, model, checks: [], failures: [], infra: {} };
 
   const add = (name, ok, detail) => {
     report.checks.push({ name, ok, detail });
     if (!ok) { report.ok = false; report.failures.push(`${name}: ${detail}`); }
   };
+  const note = (name, ok, detail) => { report.checks.push({ name, ok, detail }); };
 
-  add("output-fixtures-writable", true,
-    `synthetic fixtures use fs only under ${outputFixtures.DEFAULT_BASE}`);
+  // --- Scientific-mode gates (always enforced) ---
+  const mode = ctx.config && ctx.config.mode && ctx.config.mode.name;
+  add("app-mode-research", mode === "research",
+    mode === "research" ? 'APP_MODE=research' : `APP_MODE must be "research" for a scientific run, got "${mode}"`);
 
+  const ltmEnabled = !!(ctx.config && ctx.config.memory && ctx.config.memory.longTermEnabled);
+  add("long-term-memory-writes-disabled", ltmEnabled === false,
+    ltmEnabled === false
+      ? "LONG_TERM_MEMORY_ENABLED=false (no runtime Chroma writes)"
+      : "LONG_TERM_MEMORY_ENABLED must be false — runtime learning would write newly blocked patterns into Chroma and contaminate C5 with C4-produced data");
+
+  // --- Git cleanliness (enforced for real runs) ---
+  if (ctx.requireCleanGit) {
+    let g = null;
+    try { g = await ctx.gitProvenance(); } catch (_) { g = null; }
+    report.infra.git = g;
+    const clean = !!(g && g.dirty === false);
+    add("git-clean", clean,
+      clean ? `working tree clean @ ${g.commit} (${g.branch})`
+            : `working tree must be clean for a scientific run${g ? ` (dirty @ ${g.commit})` : " (git state unavailable)"}`);
+  } else {
+    note("git-clean", true, "not enforced (exploratory preflight / not a real run)");
+  }
+
+  // --- Fixture base really writable + safe ---
+  let fx;
+  try { fx = await assertFixtureBaseSafe(ctx.fixtureBase); }
+  catch (e) { fx = { ok: false, detail: e.message }; }
+  add("fixture-base-safe", fx.ok, fx.detail);
+
+  // --- Ollama (semantic configs C2–C5) ---
+  const needSemantic = configs.some((c) => c.requiresSemantic);
   if (needSemantic) {
     let available = false;
-    try { available = await ctx.inferenceProvider.isAvailable(); }
-    catch (e) { available = false; report.checks.push({ name: "ollama-probe-error", ok: false, detail: e.message }); }
+    try { available = await ctx.inferenceProvider.isAvailable(); } catch (_) { available = false; }
     add("ollama-reachable", available,
-      available ? `inference backend reachable` : `inference backend unreachable (semantic configs C2–C5 selected)`);
+      available ? "inference backend reachable" : "inference backend unreachable (semantic configs C2–C5 selected)");
+
     if (available) {
-      let hasModel = false;
-      try { hasModel = await ctx.inferenceProvider.hasModel(model); }
-      catch (e) { hasModel = false; }
-      add("ollama-model-present", hasModel,
-        hasModel ? `model "${model}" present` : `model "${model}" NOT present on backend`);
+      let resolved = null;
+      try {
+        resolved = typeof ctx.inferenceProvider.resolveModel === "function"
+          ? await ctx.inferenceProvider.resolveModel(model)
+          : null;
+      } catch (_) { resolved = null; }
+      if (resolved) { report.infra.modelResolved = resolved.name; report.infra.modelDigest = resolved.digest || null; }
+      // A scientific run must pin an exact model AND record its digest.
+      const modelOk = !!(resolved && resolved.digest);
+      add("ollama-model-resolved", modelOk,
+        !resolved ? `model "${model}" not uniquely resolvable (absent or ambiguous tag)`
+          : resolved.digest ? `model "${model}" → ${resolved.name} @ ${resolved.digest}`
+            : `model "${model}" resolved to ${resolved.name} but NO digest is available`);
+
+      let ver = null;
+      try { ver = typeof ctx.inferenceProvider.version === "function" ? await ctx.inferenceProvider.version() : null; }
+      catch (_) { ver = null; }
+      report.infra.ollamaVersion = ver;
+      // Version is recorded when the client exposes it (informational, non-gating).
+      note("ollama-version", ver != null, ver != null ? `ollama server ${ver}` : "ollama server version not exposed by client");
+      report.infra.ollamaHost = ctx.config && ctx.config.ollama && ctx.config.ollama.host;
     } else {
-      add("ollama-model-present", false, `cannot verify model "${model}" (backend unreachable)`);
+      add("ollama-model-resolved", false, `cannot resolve model "${model}" (backend unreachable)`);
     }
   } else {
-    report.checks.push({ name: "ollama-reachable", ok: true, detail: "not required (no semantic config selected)" });
+    note("ollama-reachable", true, "not required (no semantic config selected)");
   }
 
+  // --- Chroma / RAG (C5) ---
+  const needRAG = configs.some((c) => c.requiresRAG);
   if (needRAG) {
-    let ragAvailable = false;
-    try { ragAvailable = await ctx.vectorStore.isAvailable(); }
-    catch (e) { ragAvailable = false; report.checks.push({ name: "chroma-probe-error", ok: false, detail: e.message }); }
-    add("chroma-rag-available", ragAvailable,
-      ragAvailable
-        ? `vector store reachable`
-        : `vector store/RAG unavailable (C5 selected). The runner does NOT start, seed, reset or destroy Chroma — a controlled, pre-seeded Chroma is required.`);
+    let available = false;
+    try { available = await ctx.vectorStore.isAvailable(); } catch (_) { available = false; }
+    report.infra.chromaAvailable = available;
+    add("chroma-rag-available", available,
+      available ? "vector store reachable"
+        : "vector store/RAG unavailable (C5 selected). The runner never starts, seeds, resets or destroys Chroma — a controlled, pre-seeded Chroma is required.");
+    if (available && typeof ctx.vectorStore.collectionInfo === "function") {
+      let info = null;
+      try { info = await ctx.vectorStore.collectionInfo(); } catch (_) { info = null; }
+      if (info) {
+        report.infra.chromaCollectionName = info.name;
+        report.infra.chromaCollectionCount = info.count;
+      }
+      report.infra.chromaHost = ctx.config && ctx.config.chromadb && ctx.config.chromadb.host;
+      const nonEmpty = !!(info && typeof info.count === "number" && info.count > 0);
+      add("chroma-collection-seeded", nonEmpty,
+        info ? `collection "${info.name}" count=${info.count}${nonEmpty ? "" : " — empty collection means C5 has no RAG data (unseeded)"}`
+          : "collection info unavailable");
+    }
   } else {
-    report.checks.push({ name: "chroma-rag-available", ok: true, detail: "not required (C5 not selected)" });
+    note("chroma-rag-available", true, "not required (C5 not selected)");
   }
 
+  report.infra.seedChroma = needRAG ? seedChromaProvenance() : null;
   return report;
 }
 
@@ -258,6 +458,7 @@ function planDryRun(ctx, classified) {
   const rlGroups = groupBySequence(rateLimit, "testName", "sequenceIndex");
   const mtGroups = groupBySequence(multiTurn, "sequenceName", "turnIndex");
   const perConfigRecords = independent.length + rateLimit.length + multiTurn.length;
+  const nConfigs = ctx.configs.length;
   const semanticConfigs = ctx.configs.filter((c) => c.requiresSemantic).map((c) => c.id);
   const ragConfigs = ctx.configs.filter((c) => c.requiresRAG).map((c) => c.id);
   return {
@@ -265,7 +466,7 @@ function planDryRun(ctx, classified) {
     configs: ctx.configs.map((c) => ({ id: c.id, name: c.name, options: c.options })),
     model: ctx.model,
     counts: {
-      totalRecords: independent.length + rateLimit.length + multiTurn.length,
+      totalRecords: perConfigRecords,
       independent: independent.length,
       rateLimit: rateLimit.length,
       rateLimitSequences: rlGroups.size,
@@ -273,8 +474,12 @@ function planDryRun(ctx, classified) {
       multiTurnSequences: mtGroups.size,
       outputProbeFixtures: outputProbe.length,
     },
-    plannedAblationRows: perConfigRecords * ctx.configs.length,
-    plannedOutputProbeRuns: outputProbe.length * ctx.configs.length,
+    // Every record is executed once per config; output probes reuse that same
+    // execution and add ZERO additional pipeline calls.
+    plannedRecordEvaluations: perConfigRecords * nConfigs,
+    plannedProcessInputCalls: perConfigRecords * nConfigs,
+    plannedOutputProbeScores: outputProbe.length * nConfigs,
+    plannedAdditionalOutputProbeExecutions: 0,
     dependencies: {
       semanticRequiredBy: semanticConfigs,
       ragRequiredBy: ragConfigs,
@@ -290,7 +495,6 @@ function assertSafeOutputDir(rawDir) {
     throw new OutputPathError("--output-dir is required for a real run");
   }
   const raw = String(rawDir).trim();
-  // Reject obviously dangerous literal tokens outright.
   const banned = new Set(["/", ".", "..", "/tmp", "~"]);
   if (banned.has(raw)) throw new OutputPathError(`refusing unsafe --output-dir "${raw}"`);
   const abs = path.resolve(raw);
@@ -353,7 +557,8 @@ function baseRow(entry, config) {
 
 async function runConfig(ctx, config, classified, sink) {
   const { independent, rateLimit, multiTurn } = classified;
-  const opts = { ...config.options, ollamaModel: ctx.model };
+  // Every record is executed once with diagnostics ON (evaluation-only).
+  const opts = { ...config.options, ollamaModel: ctx.model, captureEvaluationDiagnostics: true };
 
   // Reset all defenses at config boundary (matches historical runner).
   ctx.resetPipeline();
@@ -404,26 +609,43 @@ async function runConfig(ctx, config, classified, sink) {
   }
 }
 
+/**
+ * Execute ONE record ONCE and record everything derived from that single call:
+ * the ablation row, structured validity signals, and — for a synthetic fixture
+ * record — the output-safety score (from the SAME pipeline result, never a
+ * second processInput call).
+ */
 async function runOneRecord(ctx, config, entry, opts, sink, meta) {
+  const isFixture = outputFixtures.isFixtureRecord(entry);
   const row = baseRow(entry, config);
   row.evaluationExpectedLabel = meta.evaluationExpectedLabel;
   row.layerApplicable = meta.layerApplicable;
   const start = ctx.now();
-  let result = null;
   try {
-    result = await ctx.processInput(entry.input, opts);
+    const result = await ctx.processInput(entry.input, opts);
     row.latencyMs = ctx.now() - start;
     row.predictedLabel = classifyResult(result);
     row.violationType = result.violationType;
     row.confidence = result.confidence;
     row.reasoning = result.reasoning;
     row.error = null;
-    row.fallbackSuspected = detectFallback(config, result);
-    if (row.fallbackSuspected) {
+    const diag = extractDiagnostics(result);
+    row.diagnostics = diag ? { ...diag } : null;
+    row.semanticFallback = detectSemanticFallback(config, result);
+    row.ragInfraFailure = detectRagInfraFailure(config, result);
+    if (row.semanticFallback) {
       accountError(sink.errors, "modelErrors");
-      sink.fallbackReasons.add(
-        `config ${config.id} record ${entry.id}: semantic layer degraded to rule-only`,
-      );
+      sink.fallbackReasons.add(`config ${config.id} record ${entry.id}: semantic layer degraded to rule-only (fallback)`);
+    }
+    if (row.ragInfraFailure) {
+      accountError(sink.errors, "dependencyErrors");
+      sink.ragFailureReasons.add(`config ${config.id} record ${entry.id}: RAG vector-store query failed/unavailable`);
+    }
+    if (isFixture) {
+      const scored = outputFixtures.scoreOutputProbe(entry, result);
+      scored.config = config.name; scored.configId = config.id;
+      scored.derivedFromAblationExecution = true;
+      sink.outputProbes.push(scored);
     }
   } catch (e) {
     row.latencyMs = ctx.now() - start;
@@ -432,8 +654,16 @@ async function runOneRecord(ctx, config, entry, opts, sink, meta) {
     row.confidence = null;
     row.reasoning = null;
     row.error = e.message || String(e);
-    row.fallbackSuspected = false;
+    row.diagnostics = null;
+    row.semanticFallback = false;
+    row.ragInfraFailure = false;
     accountError(sink.errors, "executionErrors");
+    if (isFixture) {
+      const scored = outputFixtures.scoreOutputProbe(entry, null, e);
+      scored.config = config.name; scored.configId = config.id;
+      scored.derivedFromAblationExecution = true;
+      sink.outputProbes.push(scored);
+    }
   }
   row.correct = row.error == null && row.predictedLabel === row.evaluationExpectedLabel;
   sink.ablation.push(row);
@@ -475,29 +705,6 @@ function buildMultiTurnSequence(config, sequenceName, entries, rows) {
   };
 }
 
-// ─── Output-probe pass ───────────────────────────────────────────────────────
-
-async function runOutputProbes(ctx, config, outputProbeRecords, sink) {
-  const opts = { ...config.options, ollamaModel: ctx.model };
-  const probes = [];
-  for (const record of outputProbeRecords) {
-    ctx.resetPipeline();
-    let scored;
-    try {
-      const result = await ctx.processInput(record.input, opts);
-      scored = outputFixtures.scoreOutputProbe(record, result);
-    } catch (e) {
-      scored = outputFixtures.scoreOutputProbe(record, null, e);
-      accountError(sink.errors, "executionErrors");
-    }
-    scored.config = config.name;
-    scored.configId = config.id;
-    probes.push(scored);
-    ctx.checkAborted();
-  }
-  return { config: config.name, configId: config.id, probes, metrics: metrics.outputSafetyMetrics(probes) };
-}
-
 // ─── Aggregation ─────────────────────────────────────────────────────────────
 
 function summarizeConfig(configId, configName, rows) {
@@ -509,9 +716,7 @@ function summarizeConfig(configId, configName, rows) {
     recordsTotal: rows.length,
     recordsScored: scored.length,
     recordsErrored: rows.length - scored.length,
-    // Layer-aware evaluation (primary): uses evaluationExpectedLabel.
     evaluationMetrics: metrics.deriveMetrics(evalCm),
-    // Raw dataset-label metrics (secondary, clearly named): uses datasetExpectedLabel.
     rawDatasetMetrics: metrics.deriveMetrics(rawCm),
     perCategory: metrics.perCategory(scored, "evaluationExpectedLabel"),
     latency: metrics.latencyStats(rows.map((r) => r.latencyMs)),
@@ -519,12 +724,17 @@ function summarizeConfig(configId, configName, rows) {
   };
 }
 
+function groupOutputProbes(outputProbes, configs) {
+  const byConfig = [];
+  for (const c of configs) {
+    const probes = outputProbes.filter((p) => p.configId === c.id);
+    byConfig.push({ config: c.name, configId: c.id, probes, metrics: metrics.outputSafetyMetrics(probes) });
+  }
+  return byConfig;
+}
+
 // ─── Full run orchestration ──────────────────────────────────────────────────
 
-/**
- * Build a run context from options, wiring real dependencies by default. Tests
- * inject mocks for every external touch-point.
- */
 function makeContext(options = {}) {
   const config = options.config || require("../../packages/research-core/src/utils/config");
   const providers = options.providers ||
@@ -539,16 +749,19 @@ function makeContext(options = {}) {
     configs,
     model,
     datasetPath: options.datasetPath || DEFAULT_DATASET,
+    manifestPath: options.manifestPath || DEFAULT_MANIFEST,
     datasetInfo: options.datasetInfo || null,
     outputDir: options.outputDir || null,
     overwrite: !!options.overwrite,
     verbose: !!options.verbose,
+    requireCleanGit: !!options.requireCleanGit,
     fixtureBase: options.fixtureBase || outputFixtures.DEFAULT_BASE,
     config,
     inferenceProvider: options.inferenceProvider || providers.defaultInferenceProvider,
     vectorStore: options.vectorStore || providers.defaultVectorStore,
     processInput: options.processInput || agent.processInput,
     resetPipeline: options.resetPipeline || agent.resetRateLimiter,
+    gitProvenance: options.gitProvenance || provenance.gitProvenance,
     now: options.now || (() => Date.now()),
     logger: options.logger || (() => {}),
     _aborted: false,
@@ -562,47 +775,63 @@ function makeContext(options = {}) {
 }
 
 /**
- * Execute the full evaluation. Assumes ctx.dataset/classified are provided (real
- * run) or loads them. Runs preflight first (unless deps are pre-validated) and
- * refuses to proceed when a required dependency is unavailable.
+ * Execute the full evaluation. Loads + hard-gates the dataset AND manifest, runs
+ * preflight (unless a report is injected), executes every record once per
+ * config, scores output probes from those same executions, and computes the
+ * scientific-validity status (VALID/INVALID). Structural failures throw and are
+ * surfaced as FAILED by the CLI.
  */
 async function runEvaluation(ctx, deps = {}) {
   const startedAt = new Date().toISOString();
   const t0 = ctx.now();
 
-  // Load + gate the dataset (idempotent if already loaded).
+  // Load + gate the dataset.
   let dataset = deps.dataset;
   if (!dataset) {
     const loaded = loadDataset(ctx.datasetPath, { fs: deps.fs, frozen: deps.frozen });
     dataset = loaded.dataset;
     ctx.datasetInfo = loaded.datasetInfo;
   }
+
+  // Load + gate the manifest, and cross-check it against the dataset SHA.
+  let manifestInfo = deps.manifestInfo || null;
+  if (!manifestInfo && !deps.skipManifestGate) {
+    manifestInfo = loadManifest(ctx.manifestPath, { fs: deps.fs }).manifestInfo;
+  }
+  if (manifestInfo && ctx.datasetInfo && manifestInfo.facts) {
+    if (manifestInfo.facts.datasetSha256 !== ctx.datasetInfo.sha256) {
+      throw new DatasetIntegrityError(
+        `dataset/manifest disagree: manifest.datasetSha256=${manifestInfo.facts.datasetSha256} but dataset file sha=${ctx.datasetInfo.sha256}`,
+        { manifest: manifestInfo.facts.datasetSha256, dataset: ctx.datasetInfo.sha256 },
+      );
+    }
+  }
+
   const classified = classifyRecords(dataset);
 
   // Preflight — hard requirement for a real run.
   const preflightReport = deps.preflightReport || (await preflight(ctx));
   if (!preflightReport.ok) {
     throw new PreflightError(
-      "preflight failed; required dependencies unavailable:\n  - " +
+      "preflight failed; scientific preconditions/dependencies not met:\n  - " +
         preflightReport.failures.join("\n  - "),
       preflightReport,
     );
   }
 
-  // Output dir prepared by caller (assertSafeOutputDir + existence checks).
   const sink = {
     ablation: [],
     sequences: [],
-    outputProbeByConfig: [],
+    outputProbes: [],
     errors: newErrorAccount(),
     fallbackReasons: new Set(),
+    ragFailureReasons: new Set(),
   };
 
-  let status = "VALID";
   const invalidReasons = [];
 
-  // Create synthetic fixtures once (fs only) so both the ablation pass and the
-  // output-probe pass see consistent listings. Skipped if there are none.
+  // Create synthetic fixtures once (fs only) so the single execution of each
+  // fixture record lists real content. Skipped if there are none.
   if (classified.outputProbe.length > 0) {
     ctx._fixtureSet = new outputFixtures.FixtureSet(ctx.fixtureBase);
     for (const record of classified.outputProbe) {
@@ -615,9 +844,6 @@ async function runEvaluation(ctx, deps = {}) {
     for (const config of ctx.configs) {
       ctx.logger(`[${config.id}/${config.name}] starting`);
       await runConfig(ctx, config, classified, sink);
-      if (classified.outputProbe.length > 0) {
-        sink.outputProbeByConfig.push(await runOutputProbes(ctx, config, classified.outputProbe, sink));
-      }
       ctx.logger(`[${config.id}/${config.name}] done`);
     }
   } finally {
@@ -627,14 +853,37 @@ async function runEvaluation(ctx, deps = {}) {
     }
   }
 
-  // Determine run validity. A silent semantic fallback is the one condition that
-  // makes results untrustworthy, so it forces INVALID. Fixture problems and
-  // isolated execution errors are surfaced (counts + invalidReasons) but do not
-  // by themselves invalidate the ablation — they remain visible, never hidden.
-  if (sink.fallbackReasons.size > 0) {
-    status = "INVALID";
-    for (const r of sink.fallbackReasons) invalidReasons.push(r);
+  // ── Scientific-validity contract ────────────────────────────────────────────
+  // VALID requires: no semantic fallback, no C5 RAG infra failure, ZERO errors
+  // of any kind, and COMPLETE sample counts (every record scored for every
+  // config). Anything else → INVALID (diagnostic artifacts are still emitted).
+  for (const r of sink.fallbackReasons) invalidReasons.push(r);
+  for (const r of sink.ragFailureReasons) invalidReasons.push(r);
+
+  const expectedPerConfig =
+    classified.independent.length + classified.rateLimit.length + classified.multiTurn.length;
+  const expectedAblation = expectedPerConfig * ctx.configs.length;
+  if (sink.ablation.length !== expectedAblation) {
+    invalidReasons.push(`incomplete ablation: got ${sink.ablation.length} rows, expected ${expectedAblation}`);
   }
+  for (const c of ctx.configs) {
+    const rows = sink.ablation.filter((r) => r.configId === c.id);
+    const scored = rows.filter((r) => r.error == null).length;
+    if (rows.length !== expectedPerConfig || scored !== expectedPerConfig) {
+      invalidReasons.push(`config ${c.id} incomplete: scored ${scored}/${rows.length}, expected ${expectedPerConfig}`);
+    }
+  }
+  const expectedProbeScores = classified.outputProbe.length * ctx.configs.length;
+  if (classified.outputProbe.length > 0 && sink.outputProbes.length !== expectedProbeScores) {
+    invalidReasons.push(`incomplete output-probe scores: got ${sink.outputProbes.length}, expected ${expectedProbeScores}`);
+  }
+  if (sink.errors.totalErrors > 0) {
+    invalidReasons.push(`run contains ${sink.errors.totalErrors} error(s): ` +
+      `model=${sink.errors.modelErrors} dependency=${sink.errors.dependencyErrors} ` +
+      `execution=${sink.errors.executionErrors} fixture=${sink.errors.fixtureErrors} unknown=${sink.errors.unknownErrors}`);
+  }
+
+  const status = invalidReasons.length > 0 ? "INVALID" : "VALID";
 
   const finishedAt = new Date().toISOString();
   const durationMs = ctx.now() - t0;
@@ -644,20 +893,30 @@ async function runEvaluation(ctx, deps = {}) {
     const rows = sink.ablation.filter((r) => r.configId === c.id);
     return summarizeConfig(c.id, c.name, rows);
   });
+  const outputProbeByConfig = groupOutputProbes(sink.outputProbes, ctx.configs);
 
   const counts = {
     ablationRows: sink.ablation.length,
+    processInputCalls: sink.ablation.length, // one per record per config
     sequences: sink.sequences.length,
-    outputProbeRuns: sink.outputProbeByConfig.reduce((n, x) => n + x.probes.length, 0),
+    outputProbeScores: sink.outputProbes.length,
+    additionalOutputProbeExecutions: 0,
     configs: ctx.configs.length,
     ...sink.errors,
   };
 
-  const gitProv = deps.git || (await provenance.gitProvenance());
+  const gitProv = deps.git ||
+    (preflightReport.infra && preflightReport.infra.git) ||
+    (await ctx.gitProvenance());
+
   const manifest = provenance.buildRunManifest({
     frozen: deps.frozen || FROZEN,
     datasetInfo: ctx.datasetInfo,
+    manifestInfo,
     configs: ctx.configs,
+    modelRequested: ctx.model,
+    infra: preflightReport.infra || {},
+    seedChroma: (preflightReport.infra && preflightReport.infra.seedChroma) || null,
     cli: ctx.cliSnapshot || null,
     preflight: preflightReport,
     git: gitProv,
@@ -683,10 +942,12 @@ async function runEvaluation(ctx, deps = {}) {
     schema: "ceda-1000-output-probe/v1",
     status,
     note:
-      "BLOCKED_INPUT means the input was blocked (over-blocking); it is NOT an " +
-      "output-filter success and is excluded from the leakage denominator. " +
-      "Leakage/safe rates are computed only over probes that produced output.",
-    byConfig: sink.outputProbeByConfig,
+      "Each output-probe score is derived from the SAME single pipeline " +
+      "execution as its ablation row (no extra processInput calls). " +
+      "BLOCKED_INPUT is over-blocking, NOT an output-filter success, and is " +
+      "excluded from the leakage denominator; leakage/safe rates are computed " +
+      "only over probes that produced output.",
+    byConfig: outputProbeByConfig,
   };
 
   const sequenceDoc = {
@@ -702,9 +963,9 @@ async function runEvaluation(ctx, deps = {}) {
     outputProbe: outputProbeDoc,
     sequences: sequenceDoc,
     errors: sink.errors,
+    counts,
   };
 
-  // Persist (real run only).
   if (ctx.outputDir) {
     await writeOutputs(ctx, results);
   }
@@ -748,16 +1009,19 @@ function cleanupSync(ctx) {
 
 module.exports = {
   // constants / errors
-  FROZEN, REPO_ROOT, DEFAULT_DATASET, FORBIDDEN_OUTPUT_DIRS, OUTPUT_FILES,
+  FROZEN, REPO_ROOT, DEFAULT_DATASET, DEFAULT_MANIFEST, FORBIDDEN_OUTPUT_DIRS,
+  OUTPUT_FILES, MANIFEST_EXPECTED, SEED_CHROMA_EXPECTED_SHA,
   PreflightError, DatasetIntegrityError, OutputPathError,
-  // dataset
+  // dataset + manifest
   sha256Hex, categoryCounts, labelCounts, checkFrozen, loadDataset,
+  checkManifest, loadManifest, seedChromaProvenance,
   // classification
-  isStatefulEntry, classifyRecords, groupBySequence, classifyResult, detectFallback,
+  isStatefulEntry, classifyRecords, groupBySequence, classifyResult,
+  detectSemanticFallback, detectRagInfraFailure, detectFallback, extractDiagnostics,
   // phases
-  preflight, planDryRun, runConfig, runOutputProbes, runOneRecord,
+  preflight, planDryRun, runConfig, runOneRecord, assertFixtureBaseSafe,
   // aggregation
-  summarizeConfig,
+  summarizeConfig, groupOutputProbes,
   // output paths
   assertSafeOutputDir, atomicWriteJSON, writeOutputs,
   // orchestration
